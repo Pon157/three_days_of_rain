@@ -347,13 +347,14 @@ async def process_broadcast(message: types.Message, state: FSMContext):
 
 async def main():
     await init_db()
-    # Циклом добавляем каждого владельца в БД админов
+    
+    # Теперь перебираем список OWNER_IDS и добавляем каждого в базу админов
     for owner_id in OWNER_IDS:
         await add_admin_db(owner_id)
         
-    print(f"Бот запущен! Владельцы: {OWNER_IDS}")
+    print(f"Бот запущен! Владельцы с полным доступом: {OWNER_IDS}")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)8
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
