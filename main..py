@@ -8,18 +8,17 @@ import datetime
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
 # --- КОНФИГУРАЦИЯ ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
+OWNER_ID = int(os.getenv("OWNER_ID")) # ID главного админа
 
-# Проверка токена
 if not BOT_TOKEN:
     exit("Ошибка: BOT_TOKEN не найден в .env")
 
@@ -36,6 +35,7 @@ class BroadcastState(StatesGroup):
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Таблица пользователей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -46,8 +46,15 @@ async def init_db():
                 reg_date TEXT
             )
         """)
+        # Таблица администраторов (кто может делать рассылку и смотреть стату)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
         await db.commit()
 
+# --- ФУНКЦИИ БД ---
 async def get_user_by_id(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -77,6 +84,22 @@ async def update_warns(user_id, count):
         await db.execute("UPDATE users SET warns = ? WHERE user_id = ?", (count, user_id))
         await db.commit()
 
+async def is_admin(user_id):
+    if user_id == OWNER_ID: return True
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def add_admin_db(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+        await db.commit()
+
+async def del_admin_db(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        await db.commit()
+
 async def get_stats_data():
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT count(*) FROM users") as c: total = (await c.fetchone())[0]
@@ -95,17 +118,17 @@ async def cmd_start(message: types.Message):
     user = await get_user_by_id(message.from_user.id)
     if user and user[4]: return # Бан
 
-    # Ссылка на картинку (можешь заменить на свою или удалить этот блок)
     photo_url = "https://cdn-icons-png.flaticon.com/512/9703/9703596.png" 
     text = (
         "👋 <b>Добро пожаловать в Анонимный Чат!</b>\n\n"
-        "Все, что вы напишете здесь, будет отправлено нашим операторам анонимно.\n"
-        "Мы не видим вашего профиля, имени или ID.\n\n"
-        "✍️ <i>Просто отправьте сообщение...</i>"
+        "Всё написанное здесь будет анонимно передано операторам.\n"
+        "Мы не видим вашего профиля."
     )
     
     try:
-        await message.answer_photo(photo=photo_url, caption=text, parse_mode="HTML")
+        sent_msg = await message.answer_photo(photo=photo_url, caption=text, parse_mode="HTML")
+        # Закрепляем сообщение
+        await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
     except:
         await message.answer(text, parse_mode="HTML")
 
@@ -114,11 +137,10 @@ async def user_message(message: types.Message):
     user_id = message.from_user.id
     user = await get_user_by_id(user_id)
     
-    if user and user[4]: return # Бан
+    if user and user[4]: return # Бан (игнор)
     
     topic_id = None
     if not user:
-        # Создаем нового юзера
         anon_name = f"Anon #{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
         try:
             topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=anon_name)
@@ -132,7 +154,7 @@ async def user_message(message: types.Message):
             )
         except Exception as e:
             logging.error(f"Ошибка создания топика: {e}")
-            await message.answer("Ошибка системы. Попробуйте позже.")
+            await message.answer("Ошибка системы.")
             return
     else:
         topic_id = user[1]
@@ -140,94 +162,150 @@ async def user_message(message: types.Message):
     # Пересылка сообщения админам
     try:
         await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=topic_id)
+        
+        # Уведомление "Отправлено" и удаление через 5 сек
+        sent_confirm = await message.answer("✅ Сообщение отправлено")
+        await asyncio.sleep(5)
+        await sent_confirm.delete()
+        
     except Exception as e:
-        await message.answer("Не удалось отправить сообщение.")
+        pass # Ошибки при удалении или отправке игнорируем, чтобы не спамить
 
 # --- ХЕНДЛЕРЫ АДМИНОВ (Только в группе) ---
 
-# Фильтр: Сообщение в группе админов, но НЕ команда
+# Ответ админа юзеру
 @dp.message(F.chat.id == ADMIN_GROUP_ID, F.message_thread_id, ~F.text.startswith("/"))
 async def admin_reply(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    
-    # Если это топик General (id=None) или юзер не найден - игнор
     if not user: return
 
     try:
         await message.copy_to(chat_id=user[0])
     except TelegramForbiddenError:
-        await message.reply("❌ Пользователь заблокировал бота.")
+        await message.reply("❌ Юзер заблокировал бота.")
     except Exception as e:
         await message.reply(f"❌ Ошибка: {e}")
 
-# Команда /ban
+# БАН
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("ban"))
 async def cmd_ban(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик пользователя.")
+    if not user: return await message.reply("Это не топик юзера.")
     
     await update_ban(user[0], True)
     await message.reply(f"⛔ Пользователь {user[2]} <b>ЗАБАНЕН</b>.", parse_mode="HTML")
-    try: await bot.send_message(user[0], "⛔ Вы были заблокированы администрацией.")
+    try: await bot.send_message(user[0], "⛔ Вы были заблокированы.")
     except: pass
 
-# Команда /unban
+# РАЗБАН
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unban"))
 async def cmd_unban(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик пользователя.")
+    if not user: return await message.reply("Это не топик юзера.")
     
     await update_ban(user[0], False)
+    # При разбане можно сбросить варны, если нужно. Раскомментируй строку ниже:
+    # await update_warns(user[0], 0)
     await message.reply(f"✅ Пользователь {user[2]} <b>РАЗБАНЕН</b>.", parse_mode="HTML")
     try: await bot.send_message(user[0], "✅ Доступ восстановлен.")
     except: pass
 
-# Команда /warn
+# ВАРН (с автобаном на 3-м варне)
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("warn"))
 async def cmd_warn(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик пользователя.")
+    if not user: return await message.reply("Это не топик юзера.")
     
-    count = user[3] + 1
-    await update_warns(user[0], count)
-    await message.reply(f"⚠️ Варн выдан. Всего: {count}")
-    try: await bot.send_message(user[0], f"⚠️ Вам выдано предупреждение. Нарушений: {count}")
-    except: pass
+    current_warns = user[3]
+    new_warns = current_warns + 1
+    
+    if new_warns >= 3:
+        # Автоматический бан
+        await update_warns(user[0], new_warns)
+        await update_ban(user[0], True)
+        await message.reply(f"⚠️ Варн 3/3. ⛔ <b>Пользователь автоматически забанен.</b>", parse_mode="HTML")
+        try: await bot.send_message(user[0], "⛔ Вы получили 3 предупреждения и были заблокированы.")
+        except: pass
+    else:
+        # Просто выдача варна
+        await update_warns(user[0], new_warns)
+        await message.reply(f"⚠️ Варн выдан. ({new_warns}/3)")
+        try: await bot.send_message(user[0], f"⚠️ Вам выдано предупреждение ({new_warns}/3). При 3 нарушениях — бан.")
+        except: pass
 
-# Команда /unwarn
+# УДАЛЕНИЕ ВАРНА
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unwarn"))
 async def cmd_unwarn(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик пользователя.")
+    if not user: return await message.reply("Это не топик юзера.")
     
-    count = max(0, user[3] - 1)
-    await update_warns(user[0], count)
-    await message.reply(f"✅ Варн снят. Всего: {count}")
+    new_warns = max(0, user[3] - 1)
+    await update_warns(user[0], new_warns)
+    await message.reply(f"✅ Варн снят. Теперь: {new_warns}/3")
 
-# Команда /stats (Статистика)
+# --- УПРАВЛЕНИЕ АДМИНАМИ И СТАТИСТИКА ---
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("add_admin"))
+async def cmd_add_admin(message: types.Message, command: CommandObject):
+    # Только Владелец может добавлять админов
+    if message.from_user.id != OWNER_ID:
+        return await message.reply("❌ Доступ запрещен. Только Владелец может добавлять админов.")
+    
+    if not command.args:
+        return await message.reply("Использование: `/add_admin 123456789`")
+    
+    try:
+        new_admin_id = int(command.args)
+        await add_admin_db(new_admin_id)
+        await message.reply(f"✅ Пользователь {new_admin_id} добавлен в список админов (доступ к stats/broadcast).")
+    except ValueError:
+        await message.reply("ID должен быть числом.")
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("del_admin"))
+async def cmd_del_admin(message: types.Message, command: CommandObject):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply("❌ Доступ запрещен.")
+    
+    if not command.args:
+        return await message.reply("Использование: `/del_admin 123456789`")
+    
+    try:
+        rem_admin_id = int(command.args)
+        await del_admin_db(rem_admin_id)
+        await message.reply(f"🗑️ Админ {rem_admin_id} удален.")
+    except ValueError:
+        await message.reply("ID должен быть числом.")
+
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("stats"))
 async def cmd_stats(message: types.Message):
+    # Проверка прав (Владелец ИЛИ есть в таблице admins)
+    if not await is_admin(message.from_user.id):
+        return await message.reply("❌ У вас нет прав на просмотр статистики.")
+
     total, banned = await get_stats_data()
     active = total - banned
     
     text = (
         f"📊 <b>Статистика системы:</b>\n\n"
-        f"👥 Всего юзеров в базе: <b>{total}</b>\n"
+        f"👥 Всего юзеров: <b>{total}</b>\n"
         f"✅ Активных: <b>{active}</b>\n"
         f"🚫 Забаненных: <b>{banned}</b>\n"
-        f"🚀 Бот запущен: {START_TIME}"
+        f"🚀 Аптайм с: {START_TIME}"
     )
     await message.reply(text, parse_mode="HTML")
 
-# --- РАССЫЛКА (BROADCAST) ---
+# --- РАССЫЛКА (Только для админов) ---
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("broadcast"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
-    await message.reply("📢 <b>Режим рассылки</b>\nОтправьте сообщение (текст, фото, видео), которое получат все пользователи.\n/cancel - отмена", parse_mode="HTML")
+    if not await is_admin(message.from_user.id):
+        return await message.reply("❌ У вас нет прав на рассылку.")
+
+    await message.reply("📢 <b>Режим рассылки</b>\nОтправьте сообщение, которое получат ВСЕ пользователи.\n/cancel - отмена", parse_mode="HTML")
     await state.set_state(BroadcastState.waiting_for_message)
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("cancel"))
@@ -237,35 +315,39 @@ async def cancel_br(message: types.Message, state: FSMContext):
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, BroadcastState.waiting_for_message)
 async def process_broadcast(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return # Двойная проверка на всякий случай
+
     users = await get_all_users_ids()
     if not users:
-        await message.reply("Нет пользователей для рассылки.")
+        await message.reply("Нет пользователей.")
         await state.clear()
         return
 
-    msg = await message.reply(f"⏳ Начинаю рассылку на {len(users)} пользователей...")
+    msg = await message.reply(f"⏳ Рассылка на {len(users)} юзеров...")
     good, bad = 0, 0
     
     for u in users:
         try:
             await message.copy_to(chat_id=u[0])
             good += 1
-            await asyncio.sleep(0.05) # Анти-спам задержка
+            await asyncio.sleep(0.05) 
         except:
             bad += 1
             
     await msg.edit_text(
         f"📢 <b>Рассылка завершена!</b>\n"
-        f"✅ Доставлено: {good}\n"
-        f"❌ Недоставлено (блок): {bad}",
+        f"✅ Успешно: {good}\n"
+        f"❌ Блок/Ошибки: {bad}",
         parse_mode="HTML"
     )
     await state.clear()
 
-# --- ЗАПУСК ---
 async def main():
     await init_db()
-    print("Бот запущен!")
+    # Добавляем владельца в БД админов при старте, чтобы не потерять доступ
+    await add_admin_db(OWNER_ID)
+    print("Бот запущен! Owner ID:", OWNER_ID)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
