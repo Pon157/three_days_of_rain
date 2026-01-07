@@ -20,8 +20,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
 
-# Парсинг владельцев
-raw_owner_ids = os.getenv("OWNER_ID", "")
+# Читаем из .env (там у тебя OWNER_ID)
+raw_owner_ids = os.getenv("OWNER_ID", "") 
+# Создаем список OWNER_IDS (с буквой S)
 OWNER_IDS = [int(oid.strip()) for oid in raw_owner_ids.split(",") if oid.strip()]
 
 logging.basicConfig(
@@ -356,16 +357,17 @@ async def perform_broadcast(message: types.Message, state: FSMContext):
 
 async def on_startup():
     await init_db()
-    # Авто-добавление владельцев в список админов при каждом запуске
+    # Используем OWNER_IDS (согласно коду выше)
     for owner_id in OWNER_IDS:
         await add_admin_db(owner_id, 0)
     logger.info(f"Владельцы системы: {OWNER_IDS}")
 
 async def main():
     await on_startup()
-    # Удаление старых обновлений перед стартом
+    # УБИРАЕМ отсюда упоминание OWNER_ID, чтобы не было ошибок
+    print("--- БОТ ВЫШЕЛ В ОНЛАЙН ---")
+    
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Бот вышел в онлайн.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
