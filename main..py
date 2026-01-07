@@ -12,6 +12,7 @@ from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.types import Message
 
 # --- КОНФИГУРАЦИЯ ---
 load_dotenv()
@@ -116,29 +117,31 @@ async def get_all_users_ids():
 @dp.message(F.chat.type == "private", CommandStart())
 async def cmd_start(message: types.Message):
     user = await get_user_by_id(message.from_user.id)
-    if user and user[4]: return # Бан
+    if user and user[4]: 
+        return # Бан
 
-photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
-text = (
-    "👋 <b>Привет, путник мира!</b>\n\n"
-    "Знакомо чувство, когда после эпичной битвы хочется отдохнуть и поболтать с кем-то по душам? Или когда уже не хочется жить из-за тимейтов, которые идут на слив и пикают кого попало?\n"
-    "<b><a href='https://t.me/Darius_will_bot'>Теперь у тебя есть личный помощник! Представляем бота поддержки, который всегда готов выслушать все твои проблемы и несчастья и поддержать.</a></b>\n"
-    "<b><a href='https://t.me/moral_support_ML'>Здесь ты сможешь более подробно ознакомится о каждом нашем персонаже и о самом мире</a></b>"
-)
+    photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
+    text = (
+        "👋 <b>Привет, путник мира!</b>\n\n"
+        "Знакомо чувство, когда после эпичной битвы хочется отдохнуть и поболтать с кем-то по душам? Или когда уже не хочется жить из-за тимейтов, которые идут на слив и пикают кого попало?\n"
+        "<b><a href='https://t.me/Darius_will_bot'>Теперь у тебя есть личный помощник! Представляем бота поддержки, который всегда готов выслушать все твои проблемы и несчастья и поддержать.</a></b>\n"
+        "<b><a href='https://t.me/moral_support_ML'>Здесь ты сможешь более подробно ознакомится о каждом нашем персонаже и о самом мире</a></b>"
+    )
 
-try:
-    sent_msg = await message.answer_photo(photo=photo_url, caption=text, parse_mode="HTML")
-    # Закрепляем сообщение
-    await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
-except:
-    await message.answer(text, parse_mode="HTML")
+    try:
+        sent_msg = await message.answer_photo(photo=photo_url, caption=text, parse_mode="HTML")
+        # Закрепляем сообщение
+        await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
+    except Exception:
+        await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.chat.type == "private")
 async def user_message(message: types.Message):
     user_id = message.from_user.id
     user = await get_user_by_id(user_id)
     
-    if user and user[4]: return # Бан (игнор)
+    if user and user[4]: 
+        return # Бан (игнор)
     
     topic_id = None
     if not user:
@@ -179,7 +182,8 @@ async def user_message(message: types.Message):
 async def admin_reply(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return
+    if not user: 
+        return
 
     try:
         await message.copy_to(chat_id=user[0])
@@ -193,33 +197,38 @@ async def admin_reply(message: types.Message):
 async def cmd_ban(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик юзера.")
+    if not user: 
+        return await message.reply("Это не топик юзера.")
     
     await update_ban(user[0], True)
     await message.reply(f"⛔ Пользователь {user[2]} <b>ЗАБАНЕН</b>.", parse_mode="HTML")
-    try: await bot.send_message(user[0], "⛔ Вы были заблокированы.")
-    except: pass
+    try: 
+        await bot.send_message(user[0], "⛔ Вы были заблокированы.")
+    except: 
+        pass
 
 # РАЗБАН
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unban"))
 async def cmd_unban(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик юзера.")
+    if not user: 
+        return await message.reply("Это не топик юзера.")
     
     await update_ban(user[0], False)
-    # При разбане можно сбросить варны, если нужно. Раскомментируй строку ниже:
-    # await update_warns(user[0], 0)
     await message.reply(f"✅ Пользователь {user[2]} <b>РАЗБАНЕН</b>.", parse_mode="HTML")
-    try: await bot.send_message(user[0], "✅ Доступ восстановлен.")
-    except: pass
+    try: 
+        await bot.send_message(user[0], "✅ Доступ восстановлен.")
+    except: 
+        pass
 
 # ВАРН (с автобаном на 3-м варне)
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("warn"))
 async def cmd_warn(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик юзера.")
+    if not user: 
+        return await message.reply("Это не топик юзера.")
     
     current_warns = user[3]
     new_warns = current_warns + 1
@@ -229,21 +238,26 @@ async def cmd_warn(message: types.Message):
         await update_warns(user[0], new_warns)
         await update_ban(user[0], True)
         await message.reply(f"⚠️ Варн 3/3. ⛔ <b>Пользователь автоматически забанен.</b>", parse_mode="HTML")
-        try: await bot.send_message(user[0], "⛔ Вы получили 3 предупреждения и были заблокированы.")
-        except: pass
+        try: 
+            await bot.send_message(user[0], "⛔ Вы получили 3 предупреждения и были заблокированы.")
+        except: 
+            pass
     else:
         # Просто выдача варна
         await update_warns(user[0], new_warns)
         await message.reply(f"⚠️ Варн выдан. ({new_warns}/3)")
-        try: await bot.send_message(user[0], f"⚠️ Вам выдано предупреждение ({new_warns}/3). При 3 нарушениях — бан.")
-        except: pass
+        try: 
+            await bot.send_message(user[0], f"⚠️ Вам выдано предупреждение ({new_warns}/3). При 3 нарушениях — бан.")
+        except: 
+            pass
 
 # УДАЛЕНИЕ ВАРНА
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unwarn"))
 async def cmd_unwarn(message: types.Message):
     topic_id = message.message_thread_id
     user = await get_user_by_topic(topic_id)
-    if not user: return await message.reply("Это не топик юзера.")
+    if not user: 
+        return await message.reply("Это не топик юзера.")
     
     new_warns = max(0, user[3] - 1)
     await update_warns(user[0], new_warns)
