@@ -355,7 +355,7 @@ async def main():
         except Exception as e:
             logging.error(f"Не удалось добавить владельца {owner_id} в БД: {e}")
         
-    print(f"Бот запущен! Доступные владельцы: {OWNER_IDS}")
+    print(f"Бот запущен! Доступные владельцы: {OWNER_ID}")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
