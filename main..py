@@ -86,7 +86,8 @@ async def update_warns(user_id, count):
         await db.commit()
 
 async def is_admin(user_id):
-    if user_id == OWNER_ID: return True
+    if user_id == OWNER_ID: 
+        return True
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
             return await cursor.fetchone() is not None
@@ -103,8 +104,10 @@ async def del_admin_db(user_id):
 
 async def get_stats_data():
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT count(*) FROM users") as c: total = (await c.fetchone())[0]
-        async with db.execute("SELECT count(*) FROM users WHERE is_banned=1") as c: banned = (await c.fetchone())[0]
+        async with db.execute("SELECT count(*) FROM users") as c: 
+            total = (await c.fetchone())[0]
+        async with db.execute("SELECT count(*) FROM users WHERE is_banned=1") as c: 
+            banned = (await c.fetchone())[0]
     return total, banned
 
 async def get_all_users_ids():
@@ -123,8 +126,8 @@ async def cmd_start(message: types.Message):
     photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
     text = (
         "👋 <b>Привет, путник мира!</b>\n\n"
-        "Знакомо чувство, когда после эпичной битвы хочется отдохнуть и поболтать с кем-то по душам? Или когда уже не хочется жить из-за тимейтов, которые идут на слив и пикают кого попало?\n\n"
-        "<b><a href='https://t.me/Darius_will_bot'>Теперь у тебя есть личный помощник! Представляем бота поддержки, который всегда готов выслушать все твои проблемы и несчастья и поддержать.</a></b>\n\n"
+        "Знакомо чувство, когда после эпичной битвы хочется отдохнуть и поболтать с кем-то по душам? Или когда уже не хочется жить из-за тимейтов, которые идут на слив и пикают кого попало?\n"
+        "<b><a href='https://t.me/Darius_will_bot'>Теперь у тебя есть личный помощник! Представляем бота поддержки, который всегда готов выслушать все твои проблемы и несчастья и поддержать.</a></b>\n"
         "<b><a href='https://t.me/moral_support_ML'>Здесь ты сможешь более подробно ознакомится о каждом нашем персонаже и о самом мире</a></b>"
     )
 
@@ -263,7 +266,7 @@ async def cmd_unwarn(message: types.Message):
     await update_warns(user[0], new_warns)
     await message.reply(f"✅ Варн снят. Теперь: {new_warns}/3")
 
-# --- УПРАВЛЕНИЕ АДМИНАМИ И СТАТИСТИКА ---
+# --- УПРАВЛЕНИЕ АДМИНАМИ (Только для OWNER_ID) ---
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("add_admin"))
 async def cmd_add_admin(message: types.Message, command: CommandObject):
@@ -277,7 +280,7 @@ async def cmd_add_admin(message: types.Message, command: CommandObject):
     try:
         new_admin_id = int(command.args)
         await add_admin_db(new_admin_id)
-        await message.reply(f"✅ Пользователь {new_admin_id} добавлен в список админов (доступ к stats/broadcast).")
+        await message.reply(f"✅ Пользователь {new_admin_id} добавлен в список админов.")
     except ValueError:
         await message.reply("ID должен быть числом.")
 
@@ -296,10 +299,12 @@ async def cmd_del_admin(message: types.Message, command: CommandObject):
     except ValueError:
         await message.reply("ID должен быть числом.")
 
+# --- СТАТИСТИКА (Только для OWNER_ID) ---
+
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("stats"))
 async def cmd_stats(message: types.Message):
-    # Проверка прав (Владелец ИЛИ есть в таблице admins)
-    if not await is_admin(message.from_user.id):
+    # Проверка - только OWNER_ID может смотреть статистику
+    if message.from_user.id != OWNER_ID:
         return await message.reply("❌ У вас нет прав на просмотр статистики.")
 
     total, banned = await get_stats_data()
@@ -314,10 +319,11 @@ async def cmd_stats(message: types.Message):
     )
     await message.reply(text, parse_mode="HTML")
 
-# --- РАССЫЛКА (Только для админов) ---
+# --- РАССЫЛКА (Только для OWNER_ID) ---
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("broadcast"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+    # Проверка - только OWNER_ID может делать рассылку
+    if message.from_user.id != OWNER_ID:
         return await message.reply("❌ У вас нет прав на рассылку.")
 
     await message.reply("📢 <b>Режим рассылки</b>\nОтправьте сообщение, которое получат ВСЕ пользователи.\n/cancel - отмена", parse_mode="HTML")
@@ -330,8 +336,10 @@ async def cancel_br(message: types.Message, state: FSMContext):
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, BroadcastState.waiting_for_message)
 async def process_broadcast(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return # Двойная проверка на всякий случай
+    # Двойная проверка - только OWNER_ID
+    if message.from_user.id != OWNER_ID:
+        await state.clear()
+        return
 
     users = await get_all_users_ids()
     if not users:
@@ -360,8 +368,6 @@ async def process_broadcast(message: types.Message, state: FSMContext):
 
 async def main():
     await init_db()
-    # Добавляем владельца в БД админов при старте, чтобы не потерять доступ
-    await add_admin_db(OWNER_ID)
     print("Бот запущен! Owner ID:", OWNER_ID)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
