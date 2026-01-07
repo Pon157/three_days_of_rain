@@ -348,11 +348,14 @@ async def process_broadcast(message: types.Message, state: FSMContext):
 async def main():
     await init_db()
     
-    # Теперь перебираем список OWNER_IDS и добавляем каждого в базу админов
+    # Мы перебираем список OWNER_IDS и добавляем каждого в базу админов
     for owner_id in OWNER_IDS:
-        await add_admin_db(owner_id)
+        try:
+            await add_admin_db(owner_id)
+        except Exception as e:
+            logging.error(f"Не удалось добавить владельца {owner_id} в БД: {e}")
         
-    print(f"Бот запущен! Владельцы с полным доступом: {OWNER_IDS}")
+    print(f"Бот запущен! Доступные владельцы: {OWNER_IDS}")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
