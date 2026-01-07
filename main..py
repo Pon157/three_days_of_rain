@@ -17,7 +17,9 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
-OWNER_ID = int(os.getenv("OWNER_ID")) # ID главного админа
+# Читаем строку из .env и превращаем в список ID
+raw_owner_ids = os.getenv("OWNER_ID", "")
+OWNER_IDS = [int(oid.strip()) for oid in raw_owner_ids.split(",") if oid.strip()]
 
 if not BOT_TOKEN:
     exit("Ошибка: BOT_TOKEN не найден в .env")
@@ -85,7 +87,7 @@ async def update_warns(user_id, count):
         await db.commit()
 
 async def is_admin(user_id):
-    if user_id == OWNER_ID: return True
+    if user_id in OWNER_IDS: return True  # Проверка по списку из .env
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
             return await cursor.fetchone() is not None
