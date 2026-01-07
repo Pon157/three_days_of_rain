@@ -125,13 +125,13 @@ text = (
     "<b><a href='https://t.me/Darius_will_bot'>Теперь у тебя есть личный помощник! Представляем бота поддержки, который всегда готов выслушать все твои проблемы и несчастья и поддержать.</a></b>\n"
     "<b><a href='https://t.me/moral_support_ML'>Здесь ты сможешь более подробно ознакомится о каждом нашем персонаже и о самом мире</a></b>"
 )
-    
-    try:
-        sent_msg = await message.answer_photo(photo=photo_url, caption=text, parse_mode="HTML")
-        # Закрепляем сообщение
-        await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
-    except:
-        await message.answer(text, parse_mode="HTML")
+
+try:
+    sent_msg = await message.answer_photo(photo=photo_url, caption=text, parse_mode="HTML")
+    # Закрепляем сообщение
+    await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
+except:
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.chat.type == "private")
 async def user_message(message: types.Message):
