@@ -117,85 +117,96 @@ async def get_all_users_ids():
 
 # --- ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЕЙ ---
 
+# --- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ (Вставь перед user_message) ---
+async def get_user_data(user_id):
+    """
+    Возвращает только нужные поля: (is_banned, topic_id, topic_name)
+    Это исключает путаницу с индексами.
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        # ЯВНО указываем поля. 0 - is_banned, 1 - topic_id, 2 - topic_name
+        async with db.execute("SELECT is_banned, topic_id, topic_name FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+# --- ЖЕЛЕЗОБЕТОННАЯ ФУНКЦИЯ ОТПРАВКИ ---
 @dp.message(F.chat.type == "private")
 async def user_message(message: types.Message):
     user_id = message.from_user.id
-    user = await get_user_by_id(user_id)
     
-    # 1. Проверка бана
-    if user and user[4]: 
+    # 1. Получаем данные (четко по полям)
+    data = await get_user_data(user_id)
+    
+    # 2. ПРОВЕРКА БАНА
+    # data[0] это is_banned. Если 1 (True) — сразу выход.
+    if data and data[0]:
+        print(f"[LOG] Сообщение от забаненного {user_id} проигнорировано.")
         return 
 
     topic_id = None
     
-    # Вспомогательная функция для создания топика (чтобы не дублировать код)
+    # Внутренняя функция создания топика (чтобы вызывать её при ошибках)
     async def create_new_topic():
         anon_name = f"Anon #{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
         try:
             topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=anon_name)
-            t_id = topic.message_thread_id
-            # Если юзер был, обновляем топик, если нет — создаем
-            if user:
-                async with aiosqlite.connect(DB_NAME) as db:
-                    await db.execute("UPDATE users SET topic_id = ?, topic_name = ? WHERE user_id = ?", (t_id, anon_name, user_id))
-                    await db.commit()
-            else:
-                await create_user(user_id, t_id, anon_name)
+            new_t_id = topic.message_thread_id
             
+            # Сохраняем в БД
+            async with aiosqlite.connect(DB_NAME) as db:
+                reg_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                # Если юзер уже был в базе - обновляем, если нет - создаем
+                if data:
+                    await db.execute("UPDATE users SET topic_id = ?, topic_name = ? WHERE user_id = ?", (new_t_id, anon_name, user_id))
+                else:
+                    await db.execute("INSERT INTO users (user_id, topic_id, topic_name, reg_date) VALUES (?, ?, ?, ?)", 
+                                     (user_id, new_t_id, anon_name, reg_date))
+                await db.commit()
+            
+            # Уведомляем админов о новом топике
             await bot.send_message(
                 ADMIN_GROUP_ID, 
                 f"🆕 <b>Новый чат:</b> {anon_name}\nID: <code>{user_id}</code>", 
-                message_thread_id=t_id,
+                message_thread_id=new_t_id, 
                 parse_mode="HTML"
             )
-            return t_id
+            return new_t_id
         except Exception as e:
-            logging.error(f"Не удалось создать топик: {e}")
+            print(f"[CRITICAL ERROR] Не удалось создать топик: {e}")
+            await message.answer("⚠️ Ошибка: бот не может создать диалог. Свяжитесь с админом напрямую.")
             return None
 
-    # 2. Логика определения топика
-    if not user:
+    # 3. Определяем ID топика
+    if not data:
+        print(f"[LOG] Новый пользователь {user_id}. Создаю топик...")
         topic_id = await create_new_topic()
     else:
-        topic_id = user[1]
+        topic_id = data[1] # Берем существующий topic_id
 
-    if not topic_id:
-        await message.answer("Ошибка: не удалось связаться с администрацией.")
-        return
+    if not topic_id: return # Если создание не удалось
 
-    # 3. Попытка пересылки с "реанимацией" топика
+    # 4. ПОПЫТКА ОТПРАВКИ (С защитой от удаленного топика)
     try:
-        # Пытаемся скопировать сообщение
         await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=topic_id)
-    except TelegramBadRequest as e:
-        # Ошибка: Топик не найден (удален) или ветка закрыта
-        logging.warning(f"Ошибка отправки (возможно топик удален): {e}. Создаю новый...")
+        # Успех
+        try:
+            conf = await message.answer("✅ Отправлено")
+            await asyncio.sleep(5)
+            await conf.delete()
+        except: pass
         
-        # Создаем новый топик
+    except Exception as e:
+        print(f"[WARNING] Ошибка отправки в топик {topic_id}: {e}")
+        # Скорее всего топик удален вручную. Пробуем пересоздать.
+        print(f"[LOG] Пробую пересоздать топик для {user_id}...")
+        
         new_topic_id = await create_new_topic()
         if new_topic_id:
             try:
-                # Пробуем отправить снова в новый топик
                 await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=new_topic_id)
+                await message.answer("✅ Топик был восстановлен, сообщение отправлено.")
             except Exception as e2:
-                logging.error(f"Вторая попытка не удалась: {e2}")
-                await message.answer("❌ Ошибка доставки сообщения.")
-                return
-        else:
-            await message.answer("❌ Ошибка системы поддержки.")
-            return
-    except Exception as e:
-        logging.error(f"Неизвестная ошибка при копировании: {e}")
-        # Не говорим юзеру об ошибке, если это какая-то мелочь, но пишем в лог
-        return
-
-    # 4. Уведомление об успехе
-    try:
-        sent_confirm = await message.answer("✅ Сообщение отправлено")
-        await asyncio.sleep(5)
-        await sent_confirm.delete()
-    except:
-        pass
+                print(f"[FAIL] Повторная отправка не удалась: {e2}")
+                await message.answer("❌ Ошибка доставки. Попробуйте позже.")
         
     photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
     text = (
