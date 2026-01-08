@@ -95,7 +95,9 @@ async def safe_reply_to_user(chat_id, message: types.Message):
             elif message.sticker:
                 await bot.send_sticker(chat_id, message.sticker.file_id)
             else:
-                await bot.send_message(chat_id, "🔔 <i>(Оператор отправил файл, который не удалось отобразить)</i>", parse_mode="HTML")
+                await bot.send_message(chat_id, "🔔 <i>(Оператор отправил файл, который не удалось отобразить. Возможно это ошибка произошла, когда оператор переименовывал тему, поэтому просто ингорируйте. Она удалится через 10 секунд)</i>", parse_mode="HTML")
+                        await asyncio.sleep(5)
+        await conf.delete()
         except TelegramForbiddenError:
             logging.error(f"Пользователь {chat_id} заблокировал бота.")
         except Exception as e2:
