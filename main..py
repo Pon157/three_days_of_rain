@@ -12,448 +12,274 @@ from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-from aiogram.types import Message
 
 # --- КОНФИГУРАЦИЯ ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
-OWNER_ID = int(os.getenv("OWNER_ID")) # ID главного админа
 
-if not BOT_TOKEN:
-    exit("Ошибка: BOT_TOKEN не найден в .env")
+# Парсим ID владельцев. Обрабатываем и OWNER_ID и OWNER_IDS для надежности
+raw_owners = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID") or ""
+OWNER_IDS = [int(oid.strip()) for oid in raw_owners.split(",") if oid.strip()]
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 DB_NAME = "anon_chat.db"
-START_TIME = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# --- СОСТОЯНИЯ ---
+# --- СОСТОЯНИЯ ДЛЯ РАССЫЛКИ ---
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
 
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица пользователей
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                topic_id INTEGER,
-                topic_name TEXT,
-                warns INTEGER DEFAULT 0,
-                is_banned BOOLEAN DEFAULT 0,
-                reg_date TEXT
-            )
-        """)
-        # Таблица администраторов (кто может делать рассылку и смотреть стату)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            topic_id INTEGER,
+            topic_name TEXT,
+            warns INTEGER DEFAULT 0,
+            is_banned BOOLEAN DEFAULT 0,
+            reg_date TEXT
+        )""")
+        await db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
         await db.commit()
 
-# --- ФУНКЦИИ БД ---
-async def get_user_by_id(user_id):
+async def get_user_data(user_id=None, topic_id=None):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone()
+        if user_id:
+            async with db.execute("SELECT user_id, topic_id, topic_name, warns, is_banned FROM users WHERE user_id = ?", (user_id,)) as c:
+                return await c.fetchone()
+        if topic_id:
+            async with db.execute("SELECT user_id, topic_id, topic_name, warns, is_banned FROM users WHERE topic_id = ?", (topic_id,)) as c:
+                return await c.fetchone()
+    return None
 
-async def get_user_by_topic(topic_id):
+async def register_user(user_id, topic_id, topic_name):
+    date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT * FROM users WHERE topic_id = ?", (topic_id,)) as cursor:
-            return await cursor.fetchone()
-
-async def create_user(user_id, topic_id, topic_name):
-    reg_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, topic_id, topic_name, reg_date) VALUES (?, ?, ?, ?)", 
-            (user_id, topic_id, topic_name, reg_date)
-        )
+        await db.execute("INSERT OR REPLACE INTO users (user_id, topic_id, topic_name, reg_date) VALUES (?, ?, ?, ?)", 
+                         (user_id, topic_id, topic_name, date))
         await db.commit()
 
-async def update_ban(user_id, is_banned):
+async def update_ban(user_id, banned: bool):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (is_banned, user_id))
+        await db.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (banned, user_id))
         await db.commit()
 
-async def update_warns(user_id, count):
+async def update_warns(user_id, count: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE users SET warns = ? WHERE user_id = ?", (count, user_id))
         await db.commit()
 
-async def is_admin(user_id):
-    if user_id == OWNER_ID: 
-        return True
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def add_admin_db(user_id):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
-        await db.commit()
-
-async def del_admin_db(user_id):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-        await db.commit()
-
-async def get_stats_data():
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT count(*) FROM users") as c: 
-            total = (await c.fetchone())[0]
-        async with db.execute("SELECT count(*) FROM users WHERE is_banned=1") as c: 
-            banned = (await c.fetchone())[0]
-    return total, banned
-
-async def get_all_users_ids():
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users") as c:
-            return await c.fetchall()
-
-# --- ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЕЙ ---
-
-# --- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ (Вставь перед user_message) ---
-async def get_user_data(user_id):
+# --- ФУНКЦИЯ "ЖЕЛЕЗОБЕТОННОЙ" ОТПРАВКИ (Admin -> User) ---
+async def safe_reply_to_user(chat_id, message: types.Message):
     """
-    Возвращает только нужные поля: (is_banned, topic_id, topic_name)
-    Это исключает путаницу с индексами.
+    Пытается скопировать сообщение. Если не выходит (ошибка API) — отправляет вручную текст/фото.
     """
-    async with aiosqlite.connect(DB_NAME) as db:
-        # ЯВНО указываем поля. 0 - is_banned, 1 - topic_id, 2 - topic_name
-        async with db.execute("SELECT is_banned, topic_id, topic_name FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone()
-
-# --- ЖЕЛЕЗОБЕТОННАЯ ФУНКЦИЯ ОТПРАВКИ ---
-@dp.message(F.chat.type == "private")
-async def user_message(message: types.Message):
-    user_id = message.from_user.id
-    
-    # 1. Получаем данные (четко по полям)
-    data = await get_user_data(user_id)
-    
-    # 2. ПРОВЕРКА БАНА
-    # data[0] это is_banned. Если 1 (True) — сразу выход.
-    if data and data[0]:
-        print(f"[LOG] Сообщение от забаненного {user_id} проигнорировано.")
-        return 
-
-    topic_id = None
-    
-    # Внутренняя функция создания топика (чтобы вызывать её при ошибках)
-    async def create_new_topic():
-        anon_name = f"Anon #{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
-        try:
-            topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=anon_name)
-            new_t_id = topic.message_thread_id
-            
-            # Сохраняем в БД
-            async with aiosqlite.connect(DB_NAME) as db:
-                reg_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                # Если юзер уже был в базе - обновляем, если нет - создаем
-                if data:
-                    await db.execute("UPDATE users SET topic_id = ?, topic_name = ? WHERE user_id = ?", (new_t_id, anon_name, user_id))
-                else:
-                    await db.execute("INSERT INTO users (user_id, topic_id, topic_name, reg_date) VALUES (?, ?, ?, ?)", 
-                                     (user_id, new_t_id, anon_name, reg_date))
-                await db.commit()
-            
-            # Уведомляем админов о новом топике
-            await bot.send_message(
-                ADMIN_GROUP_ID, 
-                f"🆕 <b>Новый чат:</b> {anon_name}\nID: <code>{user_id}</code>", 
-                message_thread_id=new_t_id, 
-                parse_mode="HTML"
-            )
-            return new_t_id
-        except Exception as e:
-            print(f"[CRITICAL ERROR] Не удалось создать топик: {e}")
-            await message.answer("⚠️ Ошибка: бот не может создать диалог. Свяжитесь с админом напрямую.")
-            return None
-
-    # 3. Определяем ID топика
-    if not data:
-        print(f"[LOG] Новый пользователь {user_id}. Создаю топик...")
-        topic_id = await create_new_topic()
-    else:
-        topic_id = data[1] # Берем существующий topic_id
-
-    if not topic_id: return # Если создание не удалось
-
-    # 4. ПОПЫТКА ОТПРАВКИ (С защитой от удаленного топика)
     try:
-        await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=topic_id)
-        # Успех
-        try:
-            conf = await message.answer("✅ Отправлено")
-            await asyncio.sleep(5)
-            await conf.delete()
-        except: pass
-        
+        # Попытка №1: Красивая копия
+        await message.copy_to(chat_id)
     except Exception as e:
-        print(f"[WARNING] Ошибка отправки в топик {topic_id}: {e}")
-        # Скорее всего топик удален вручную. Пробуем пересоздать.
-        print(f"[LOG] Пробую пересоздать топик для {user_id}...")
-        
-        new_topic_id = await create_new_topic()
-        if new_topic_id:
-            try:
-                await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=new_topic_id)
-                await message.answer("✅ Топик был восстановлен, сообщение отправлено.")
-            except Exception as e2:
-                print(f"[FAIL] Повторная отправка не удалась: {e2}")
-                await message.answer("❌ Ошибка доставки. Попробуйте позже.")
-        
+        logging.warning(f"Copy failed ({e}), trying manual send...")
+        try:
+            # Попытка №2: Ручная отправка (Fallback)
+            if message.text:
+                await bot.send_message(chat_id, f"🔔 <b>Ответ оператора:</b>\n\n{message.text}", parse_mode="HTML")
+            elif message.photo:
+                await bot.send_photo(chat_id, message.photo[-1].file_id, caption=message.caption or "🔔 Ответ оператора")
+            elif message.voice:
+                await bot.send_voice(chat_id, message.voice.file_id, caption=message.caption)
+            elif message.video:
+                await bot.send_video(chat_id, message.video.file_id, caption=message.caption)
+            elif message.sticker:
+                await bot.send_sticker(chat_id, message.sticker.file_id)
+            else:
+                await bot.send_message(chat_id, "🔔 <i>(Оператор отправил файл, который не удалось отобразить)</i>", parse_mode="HTML")
+        except TelegramForbiddenError:
+            logging.error(f"Пользователь {chat_id} заблокировал бота.")
+        except Exception as e2:
+            logging.error(f"FATAL: Не удалось отправить сообщение юзеру {chat_id}: {e2}")
+
+# --- ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЯ ---
+
+@dp.message(F.chat.type == "private", CommandStart())
+async def cmd_start(message: types.Message):
+    user = await get_user_data(user_id=message.from_user.id)
+    if user and user[4]: return # Бан
+
     photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
     text = (
         "👋 <b>Привет, путник мира!</b>\n\n"
-        "Знакомо чувство, когда после эпичной битвы хочется отдохнуть и поболтать с кем-то по душам? Или когда уже не хочется жить из-за тимейтов, которые идут на слив и пикают кого попало?\n"
-        "<b><a href='https://t.me/Darius_will_bot'>Теперь у тебя есть личный помощник! Представляем бота поддержки, который всегда готов выслушать все твои проблемы и несчастья и поддержать.</a></b>\n"
-        "<b><a href='https://t.me/moral_support_ML'>Здесь ты сможешь более подробно ознакомится о каждом нашем персонаже и о самом мире</a></b>"
+        "Я — бот поддержки. Напиши сюда любой вопрос или жалобу, и операторы ответят тебе анонимно.\n"
+        "Мы готовы выслушать!"
     )
-
     try:
-        sent_msg = await message.answer_photo(photo=photo_url, caption=text, parse_mode="HTML")
-        # Закрепляем сообщение
-        await bot.pin_chat_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
-    except Exception:
+        msg = await message.answer_photo(photo_url, caption=text, parse_mode="HTML")
+        await bot.pin_chat_message(message.chat.id, msg.message_id)
+    except:
         await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.chat.type == "private")
-async def user_message(message: types.Message):
+async def user_msg(message: types.Message):
     user_id = message.from_user.id
-    user = await get_user_by_id(user_id)
+    user = await get_user_data(user_id=user_id)
     
-    if user and user[4]: 
-        return # Бан (игнор)
-    
+    if user and user[4]: return # Игнор, если забанен
+
     topic_id = None
-    if not user:
-        anon_name = f"Anon #{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
+
+    # Функция создания топика
+    async def create_topic():
+        name = f"Anon #{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
         try:
-            topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=anon_name)
-            topic_id = topic.message_thread_id
-            await create_user(user_id, topic_id, anon_name)
-            await bot.send_message(
-                ADMIN_GROUP_ID, 
-                f"🆕 <b>Новый пользователь:</b> {anon_name}\nID топика: {topic_id}", 
-                message_thread_id=topic_id,
-                parse_mode="HTML"
-            )
+            topic = await bot.create_forum_topic(ADMIN_GROUP_ID, name)
+            await register_user(user_id, topic.message_thread_id, name)
+            await bot.send_message(ADMIN_GROUP_ID, f"🆕 <b>Новый пользователь:</b> {name}", message_thread_id=topic.message_thread_id, parse_mode="HTML")
+            return topic.message_thread_id
         except Exception as e:
             logging.error(f"Ошибка создания топика: {e}")
-            await message.answer("Ошибка системы.")
-            return
+            return None
+
+    if not user:
+        topic_id = await create_topic()
     else:
         topic_id = user[1]
 
-    # Пересылка сообщения админам
+    if not topic_id:
+        return await message.answer("Ошибка связи с сервером поддержки.")
+
+    # Отправка в группу
     try:
-        await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=topic_id)
-        
-        # Уведомление "Отправлено" и удаление через 5 сек
-        sent_confirm = await message.answer("✅ Сообщение отправлено")
+        await message.copy_to(ADMIN_GROUP_ID, message_thread_id=topic_id)
+        # Подтверждение пользователю (исчезает через 5 сек)
+        conf = await message.answer("✅ Отправлено")
         await asyncio.sleep(5)
-        await sent_confirm.delete()
-        
-    except Exception as e:
-        pass # Ошибки при удалении или отправке игнорируем, чтобы не спамить
+        await conf.delete()
+    except TelegramBadRequest:
+        # Если топик удален, создаем новый и пробуем снова
+        new_tid = await create_topic()
+        if new_tid:
+            try:
+                await message.copy_to(ADMIN_GROUP_ID, message_thread_id=new_tid)
+            except: pass
+    except Exception:
+        pass
 
-# --- ХЕНДЛЕРЫ АДМИНОВ (Только в группе) ---
+# --- ХЕНДЛЕРЫ АДМИНА (В ГРУППЕ) ---
 
-# Ответ админа юзеру
-@dp.message(F.chat.id == ADMIN_GROUP_ID, F.message_thread_id, ~F.text.startswith("/"))
+@dp.message(F.chat.id == ADMIN_GROUP_ID, F.message_thread_id)
 async def admin_reply(message: types.Message):
+    # Если это команда (начинается с /), не обрабатываем как ответ
+    if message.text and message.text.startswith("/"): return
+    
+    # Ищем пользователя по ID топика
     topic_id = message.message_thread_id
-    user = await get_user_by_topic(topic_id)
-    if not user: 
-        return
+    user = await get_user_data(topic_id=topic_id)
+    
+    if not user:
+        return # Сообщение в топике, который не привязан к юзеру (или системный)
 
-    try:
-        await message.copy_to(chat_id=user[0])
-    except TelegramForbiddenError:
-        await message.reply("❌ Юзер заблокировал бота.")
-    except Exception as e:
-        await message.reply(f"❌ Ошибка: {e}")
+    # Используем надежную отправку
+    await safe_reply_to_user(user[0], message)
 
-# БАН
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("ban"))
-async def cmd_ban(message: types.Message):
-    topic_id = message.message_thread_id
-    user = await get_user_by_topic(topic_id)
-    if not user: 
-        return await message.reply("Это не топик юзера.")
+# --- КОМАНДЫ АДМИНА (BAN/WARN) ---
+
+@dp.message(Command("ban"), F.chat.id == ADMIN_GROUP_ID)
+async def ban_user(message: types.Message):
+    user = await get_user_data(topic_id=message.message_thread_id)
+    if not user: return await message.reply("Не найден пользователь для этого топика.")
     
     await update_ban(user[0], True)
-    await message.reply(f"⛔ Пользователь {user[2]} <b>ЗАБАНЕН</b>.", parse_mode="HTML")
-    try: 
-        await bot.send_message(user[0], "⛔ Вы были заблокированы.")
-    except: 
-        pass
+    await message.reply(f"🚫 Пользователь забанен.")
+    try: await bot.send_message(user[0], "🚫 Вы были заблокированы администрацией.")
+    except: pass
 
-# РАЗБАН
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unban"))
-async def cmd_unban(message: types.Message):
-    topic_id = message.message_thread_id
-    user = await get_user_by_topic(topic_id)
-    if not user: 
-        return await message.reply("Это не топик юзера.")
+@dp.message(Command("unban"), F.chat.id == ADMIN_GROUP_ID)
+async def unban_user(message: types.Message):
+    user = await get_user_data(topic_id=message.message_thread_id)
+    if not user: return
     
     await update_ban(user[0], False)
-    await message.reply(f"✅ Пользователь {user[2]} <b>РАЗБАНЕН</b>.", parse_mode="HTML")
-    try: 
-        await bot.send_message(user[0], "✅ Доступ восстановлен.")
-    except: 
-        pass
+    await update_warns(user[0], 0)
+    await message.reply(f"✅ Пользователь разбанен.")
+    try: await bot.send_message(user[0], "✅ Ваш доступ восстановлен.")
+    except: pass
 
-# ВАРН (с автобаном на 3-м варне)
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("warn"))
-async def cmd_warn(message: types.Message):
-    topic_id = message.message_thread_id
-    user = await get_user_by_topic(topic_id)
-    if not user: 
-        return await message.reply("Это не топик юзера.")
+@dp.message(Command("warn"), F.chat.id == ADMIN_GROUP_ID)
+async def warn_user(message: types.Message):
+    user = await get_user_data(topic_id=message.message_thread_id)
+    if not user: return
     
-    current_warns = user[3]
-    new_warns = current_warns + 1
-    
+    new_warns = user[3] + 1
     if new_warns >= 3:
-        # Автоматический бан
-        await update_warns(user[0], new_warns)
         await update_ban(user[0], True)
-        await message.reply(f"⚠️ Варн 3/3. ⛔ <b>Пользователь автоматически забанен.</b>", parse_mode="HTML")
-        try: 
-            await bot.send_message(user[0], "⛔ Вы получили 3 предупреждения и были заблокированы.")
-        except: 
-            pass
-    else:
-        # Просто выдача варна
         await update_warns(user[0], new_warns)
-        await message.reply(f"⚠️ Варн выдан. ({new_warns}/3)")
-        try: 
-            await bot.send_message(user[0], f"⚠️ Вам выдано предупреждение ({new_warns}/3). При 3 нарушениях — бан.")
-        except: 
-            pass
+        await message.reply("⛔ 3/3 варна. Пользователь забанен.")
+        try: await bot.send_message(user[0], "⛔ Вы забанены за нарушения (3/3).")
+        except: pass
+    else:
+        await update_warns(user[0], new_warns)
+        await message.reply(f"⚠️ Варн выдан ({new_warns}/3).")
+        try: await bot.send_message(user[0], f"⚠️ Предупреждение ({new_warns}/3).")
+        except: pass
 
-# УДАЛЕНИЕ ВАРНА
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unwarn"))
-async def cmd_unwarn(message: types.Message):
-    topic_id = message.message_thread_id
-    user = await get_user_by_topic(topic_id)
-    if not user: 
-        return await message.reply("Это не топик юзера.")
+@dp.message(Command("unwarn"), F.chat.id == ADMIN_GROUP_ID)
+async def unwarn_user(message: types.Message):
+    user = await get_user_data(topic_id=message.message_thread_id)
+    if not user: return
     
     new_warns = max(0, user[3] - 1)
     await update_warns(user[0], new_warns)
     await message.reply(f"✅ Варн снят. Теперь: {new_warns}/3")
 
-# --- УПРАВЛЕНИЕ АДМИНАМИ (Только для OWNER_ID) ---
+# --- УПРАВЛЕНИЕ АДМИНАМИ И СТАТИСТИКА (Только Владельцы) ---
 
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("add_admin"))
-async def cmd_add_admin(message: types.Message, command: CommandObject):
-    # Только Владелец может добавлять админов
-    if message.from_user.id != OWNER_ID:
-        return await message.reply("❌ Доступ запрещен. Только Владелец может добавлять админов.")
-    
-    if not command.args:
-        return await message.reply("Использование: `/add_admin 123456789`")
-    
+@dp.message(Command("add_admin"), F.chat.id == ADMIN_GROUP_ID)
+async def add_admin(message: types.Message, command: CommandObject):
+    if message.from_user.id not in OWNER_IDS: return await message.reply("❌ Нет прав.")
+    if not command.args: return await message.reply("Укажите ID.")
     try:
-        new_admin_id = int(command.args)
-        await add_admin_db(new_admin_id)
-        await message.reply(f"✅ Пользователь {new_admin_id} добавлен в список админов.")
-    except ValueError:
-        await message.reply("ID должен быть числом.")
+        uid = int(command.args)
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
+            await db.commit()
+        await message.reply(f"✅ Админ {uid} добавлен.")
+    except: await message.reply("Ошибка ID.")
 
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("del_admin"))
-async def cmd_del_admin(message: types.Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID:
-        return await message.reply("❌ Доступ запрещен.")
-    
-    if not command.args:
-        return await message.reply("Использование: `/del_admin 123456789`")
-    
-    try:
-        rem_admin_id = int(command.args)
-        await del_admin_db(rem_admin_id)
-        await message.reply(f"🗑️ Админ {rem_admin_id} удален.")
-    except ValueError:
-        await message.reply("ID должен быть числом.")
+@dp.message(Command("stats"), F.chat.id == ADMIN_GROUP_ID)
+async def stats(message: types.Message):
+    if message.from_user.id not in OWNER_IDS: return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT count(*) FROM users") as c: total = (await c.fetchone())[0]
+        async with db.execute("SELECT count(*) FROM users WHERE is_banned=1") as c: banned = (await c.fetchone())[0]
+    await message.reply(f"📊 <b>Статистика:</b>\nВсего: {total}\nВ бане: {banned}", parse_mode="HTML")
 
-# --- СТАТИСТИКА (Только для OWNER_ID) ---
-
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("stats"))
-async def cmd_stats(message: types.Message):
-    # Проверка - только OWNER_ID может смотреть статистику
-    if message.from_user.id != OWNER_ID:
-        return await message.reply("❌ У вас нет прав на просмотр статистики.")
-
-    total, banned = await get_stats_data()
-    active = total - banned
-    
-    text = (
-        f"📊 <b>Статистика системы:</b>\n\n"
-        f"👥 Всего юзеров: <b>{total}</b>\n"
-        f"✅ Активных: <b>{active}</b>\n"
-        f"🚫 Забаненных: <b>{banned}</b>\n"
-        f"🚀 Аптайм с: {START_TIME}"
-    )
-    await message.reply(text, parse_mode="HTML")
-
-# --- РАССЫЛКА (Только для OWNER_ID) ---
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("broadcast"))
-async def cmd_broadcast(message: types.Message, state: FSMContext):
-    # Проверка - только OWNER_ID может делать рассылку
-    if message.from_user.id != OWNER_ID:
-        return await message.reply("❌ У вас нет прав на рассылку.")
-
-    await message.reply("📢 <b>Режим рассылки</b>\nОтправьте сообщение, которое получат ВСЕ пользователи.\n/cancel - отмена", parse_mode="HTML")
+@dp.message(Command("broadcast"), F.chat.id == ADMIN_GROUP_ID)
+async def broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id not in OWNER_IDS: return
+    await message.reply("📢 Отправьте сообщение для рассылки.")
     await state.set_state(BroadcastState.waiting_for_message)
 
-@dp.message(F.chat.id == ADMIN_GROUP_ID, Command("cancel"))
-async def cancel_br(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.reply("Отменено.")
-
-@dp.message(F.chat.id == ADMIN_GROUP_ID, BroadcastState.waiting_for_message)
-async def process_broadcast(message: types.Message, state: FSMContext):
-    # Двойная проверка - только OWNER_ID
-    if message.from_user.id != OWNER_ID:
-        await state.clear()
-        return
-
-    users = await get_all_users_ids()
-    if not users:
-        await message.reply("Нет пользователей.")
-        await state.clear()
-        return
-
-    msg = await message.reply(f"⏳ Рассылка на {len(users)} юзеров...")
-    good, bad = 0, 0
+@dp.message(BroadcastState.waiting_for_message)
+async def do_broadcast(message: types.Message, state: FSMContext):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users WHERE is_banned=0") as c: users = await c.fetchall()
     
+    await message.reply(f"🚀 Рассылка на {len(users)} чел...")
+    count = 0
     for u in users:
         try:
-            await message.copy_to(chat_id=u[0])
-            good += 1
-            await asyncio.sleep(0.05) 
-        except:
-            bad += 1
-            
-    await msg.edit_text(
-        f"📢 <b>Рассылка завершена!</b>\n"
-        f"✅ Успешно: {good}\n"
-        f"❌ Блок/Ошибки: {bad}",
-        parse_mode="HTML"
-    )
+            await message.copy_to(u[0])
+            count += 1
+            await asyncio.sleep(0.05)
+        except: pass
+    await message.reply(f"✅ Рассылка завершена. Дошло: {count}")
     await state.clear()
 
 async def main():
     await init_db()
-    print("Бот запущен! Owner ID:", OWNER_ID)
+    print("Бот запущен. Владельцы:", OWNER_IDS)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
