@@ -117,12 +117,86 @@ async def get_all_users_ids():
 
 # --- ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЕЙ ---
 
-@dp.message(F.chat.type == "private", CommandStart())
-async def cmd_start(message: types.Message):
-    user = await get_user_by_id(message.from_user.id)
+@dp.message(F.chat.type == "private")
+async def user_message(message: types.Message):
+    user_id = message.from_user.id
+    user = await get_user_by_id(user_id)
+    
+    # 1. Проверка бана
     if user and user[4]: 
-        return # Бан
+        return 
 
+    topic_id = None
+    
+    # Вспомогательная функция для создания топика (чтобы не дублировать код)
+    async def create_new_topic():
+        anon_name = f"Anon #{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
+        try:
+            topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=anon_name)
+            t_id = topic.message_thread_id
+            # Если юзер был, обновляем топик, если нет — создаем
+            if user:
+                async with aiosqlite.connect(DB_NAME) as db:
+                    await db.execute("UPDATE users SET topic_id = ?, topic_name = ? WHERE user_id = ?", (t_id, anon_name, user_id))
+                    await db.commit()
+            else:
+                await create_user(user_id, t_id, anon_name)
+            
+            await bot.send_message(
+                ADMIN_GROUP_ID, 
+                f"🆕 <b>Новый чат:</b> {anon_name}\nID: <code>{user_id}</code>", 
+                message_thread_id=t_id,
+                parse_mode="HTML"
+            )
+            return t_id
+        except Exception as e:
+            logging.error(f"Не удалось создать топик: {e}")
+            return None
+
+    # 2. Логика определения топика
+    if not user:
+        topic_id = await create_new_topic()
+    else:
+        topic_id = user[1]
+
+    if not topic_id:
+        await message.answer("Ошибка: не удалось связаться с администрацией.")
+        return
+
+    # 3. Попытка пересылки с "реанимацией" топика
+    try:
+        # Пытаемся скопировать сообщение
+        await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=topic_id)
+    except TelegramBadRequest as e:
+        # Ошибка: Топик не найден (удален) или ветка закрыта
+        logging.warning(f"Ошибка отправки (возможно топик удален): {e}. Создаю новый...")
+        
+        # Создаем новый топик
+        new_topic_id = await create_new_topic()
+        if new_topic_id:
+            try:
+                # Пробуем отправить снова в новый топик
+                await message.copy_to(chat_id=ADMIN_GROUP_ID, message_thread_id=new_topic_id)
+            except Exception as e2:
+                logging.error(f"Вторая попытка не удалась: {e2}")
+                await message.answer("❌ Ошибка доставки сообщения.")
+                return
+        else:
+            await message.answer("❌ Ошибка системы поддержки.")
+            return
+    except Exception as e:
+        logging.error(f"Неизвестная ошибка при копировании: {e}")
+        # Не говорим юзеру об ошибке, если это какая-то мелочь, но пишем в лог
+        return
+
+    # 4. Уведомление об успехе
+    try:
+        sent_confirm = await message.answer("✅ Сообщение отправлено")
+        await asyncio.sleep(5)
+        await sent_confirm.delete()
+    except:
+        pass
+        
     photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
     text = (
         "👋 <b>Привет, путник мира!</b>\n\n"
