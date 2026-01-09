@@ -3,12 +3,13 @@ import logging
 import os
 import random
 import string
-import datetime
-import asyncpg
+from datetime import datetime
 from dotenv import load_dotenv
 
+# Используем только supabase-py, asyncpg НЕ нужен
+from supabase import create_client, Client
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandStart, CommandObject
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
