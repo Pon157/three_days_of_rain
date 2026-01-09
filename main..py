@@ -1,10 +1,10 @@
 import asyncio
 import logging
 import os
-import aiosqlite
 import random
 import string
 import datetime
+import asyncpg
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
@@ -17,112 +17,100 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Парсим ID владельцев. Обрабатываем и OWNER_ID и OWNER_IDS для надежности
+# Парсим владельцев
 raw_owners = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID") or ""
 OWNER_IDS = [int(oid.strip()) for oid in raw_owners.split(",") if oid.strip()]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-DB_NAME = "anon_chat.db"
 
-# --- СОСТОЯНИЯ ДЛЯ РАССЫЛКИ ---
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
 
-# --- БАЗА ДАННЫХ ---
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            topic_id INTEGER,
-            topic_name TEXT,
-            warns INTEGER DEFAULT 0,
-            is_banned BOOLEAN DEFAULT 0,
-            reg_date TEXT
-        )""")
-        await db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
-        await db.commit()
+# --- БАЗА ДАННЫХ (SUPABASE / POSTGRES) ---
+
+async def get_db_conn():
+    """Создает подключение к PostgreSQL."""
+    return await asyncpg.connect(DATABASE_URL)
 
 async def get_user_data(user_id=None, topic_id=None):
-    async with aiosqlite.connect(DB_NAME) as db:
-        if user_id:
-            async with db.execute("SELECT user_id, topic_id, topic_name, warns, is_banned FROM users WHERE user_id = ?", (user_id,)) as c:
-                return await c.fetchone()
-        if topic_id:
-            async with db.execute("SELECT user_id, topic_id, topic_name, warns, is_banned FROM users WHERE topic_id = ?", (topic_id,)) as c:
-                return await c.fetchone()
-    return None
-
-async def register_user(user_id, topic_id, topic_name):
-    date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO users (user_id, topic_id, topic_name, reg_date) VALUES (?, ?, ?, ?)", 
-                         (user_id, topic_id, topic_name, date))
-        await db.commit()
-
-async def update_ban(user_id, banned: bool):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (banned, user_id))
-        await db.commit()
-
-async def update_warns(user_id, count: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET warns = ? WHERE user_id = ?", (count, user_id))
-        await db.commit()
-
-# --- ФУНКЦИЯ "ЖЕЛЕЗОБЕТОННОЙ" ОТПРАВКИ (Admin -> User) ---
-async def safe_reply_to_user(chat_id, message: types.Message):
-    """
-    Пытается скопировать сообщение. Если не выходит (ошибка API) — отправляет вручную текст/фото.
-    """
+    conn = await get_db_conn()
     try:
-        # Попытка №1: Красивая копия
+        if user_id:
+            return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+        if topic_id:
+            return await conn.fetchrow("SELECT * FROM users WHERE topic_id = $1", topic_id)
+    finally:
+        await conn.close()
+
+async def register_or_update_user(tg_user: types.User, topic_id=None, topic_name=None):
+    """Регистрирует или обновляет данные пользователя (username, ник)."""
+    conn = await get_db_conn()
+    try:
+        if topic_id:
+            await conn.execute("""
+                INSERT INTO users (user_id, topic_id, topic_name, username, full_name)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET topic_id = $2, topic_name = $3, username = $4, full_name = $5
+            """, tg_user.id, topic_id, topic_name, tg_user.username, tg_user.full_name)
+        else:
+            await conn.execute("""
+                UPDATE users SET username = $1, full_name = $2 WHERE user_id = $3
+            """, tg_user.username, tg_user.full_name, tg_user.id)
+    finally:
+        await conn.close()
+
+async def update_sanction(user_id, banned=None, warns=None):
+    conn = await get_db_conn()
+    try:
+        if banned is not None:
+            await conn.execute("UPDATE users SET is_banned = $1, last_sanction_date = NOW() WHERE user_id = $2", banned, user_id)
+        if warns is not None:
+            await conn.execute("UPDATE users SET warns = $1, last_sanction_date = NOW() WHERE user_id = $2", warns, user_id)
+    finally:
+        await conn.close()
+
+# --- ФУНКЦИЯ ОТПРАВКИ ---
+
+async def safe_reply_to_user(chat_id, message: types.Message):
+    try:
         await message.copy_to(chat_id)
     except Exception as e:
-        logging.warning(f"Copy failed ({e}), trying manual send...")
+        logging.warning(f"Copy failed, trying manual: {e}")
         try:
-            # Попытка №2: Ручная отправка (Fallback)
             if message.text:
                 await bot.send_message(chat_id, f"🔔 <b>Ответ оператора:</b>\n\n{message.text}", parse_mode="HTML")
             elif message.photo:
-                await bot.send_photo(chat_id, message.photo[-1].file_id, caption=message.caption or "🔔 Ответ оператора")
+                await bot.send_photo(chat_id, message.photo[-1].file_id, caption=message.caption)
             elif message.voice:
-                await bot.send_voice(chat_id, message.voice.file_id, caption=message.caption)
+                await bot.send_voice(chat_id, message.voice.file_id)
             elif message.video:
-                await bot.send_video(chat_id, message.video.file_id, caption=message.caption)
+                await bot.send_video(chat_id, message.video.file_id)
             elif message.sticker:
                 await bot.send_sticker(chat_id, message.sticker.file_id)
-            else:
-                # Отправляем предупреждение и удаляем его через 10 секунд
-                conf = await bot.send_message(
-                    chat_id,
-                    "🔔 <i>(Оператор отправил файл, который не удалось отобразить. Возможно это ошибка произошла, когда оператор переименовывал тему, поэтому просто игнорируйте. Она удалится через 10 секунд)</i>",
-                    parse_mode="HTML"
-                )
-                await asyncio.sleep(10)  # ВАЖНО: должен быть на том же уровне отступа, что и строка выше
-                await conf.delete()
         except TelegramForbiddenError:
-            logging.error(f"Пользователь {chat_id} заблокировал бота.")
+            logging.error(f"Юзер {chat_id} заблокал бота.")
         except Exception as e2:
-            logging.error(f"FATAL: Не удалось отправить сообщение юзеру {chat_id}: {e2}")
-            
+            logging.error(f"Ошибка отправки: {e2}")
+
 # --- ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЯ ---
 
 @dp.message(F.chat.type == "private", CommandStart())
 async def cmd_start(message: types.Message):
     user = await get_user_data(user_id=message.from_user.id)
-    if user and user[4]: return # Бан
+    if user and user['is_banned']: return
 
+    await register_or_update_user(message.from_user)
+    
     photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
     text = (
-        "👋 <b>Привет, путник мира!</b>\n\n"
-        "\nЗнакомо чувство, когда после эпичной битвы хочется отдохнуть и поболтать с кем-то по душам? Или когда уже не хочется жить из-за тимейтов, которые идут на слив и пикают кого попало?\n"
-        "\n<b><a href='https://t.me/Darius_will_bot'>Теперь у тебя есть личный помощник! Представляем бота поддержки, который всегда готов выслушать все твои проблемы и несчастья и поддержать.</a></b>\n"
-        "\n<b><a href='https://t.me/moral_support_ML'>Здесь ты сможешь более подробно ознакомится о каждом нашем персонаже и о самом мире</a></b>"
+        "👋 <b>Привет, путник!</b>\n\n"
+        "Я твой анонимный помощник. Напиши мне что угодно, и оператор ответит тебе прямо здесь."
     )
-
     try:
         msg = await message.answer_photo(photo_url, caption=text, parse_mode="HTML")
         await bot.pin_chat_message(message.chat.id, msg.message_id)
@@ -134,161 +122,123 @@ async def user_msg(message: types.Message):
     user_id = message.from_user.id
     user = await get_user_data(user_id=user_id)
     
-    if user and user[4]: return # Игнор, если забанен
+    if user and user['is_banned']: return
 
-    topic_id = None
-
-    # Функция создания топика
     async def create_topic():
-        name = f"Anon #{''.join(random.choices(string.ascii_uppercase + string.digits, k=4))}"
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        name = f"Anon #{code}"
         try:
             topic = await bot.create_forum_topic(ADMIN_GROUP_ID, name)
-            await register_user(user_id, topic.message_thread_id, name)
+            await register_or_update_user(message.from_user, topic.message_thread_id, name)
             await bot.send_message(ADMIN_GROUP_ID, f"🆕 <b>Новый пользователь:</b> {name}", message_thread_id=topic.message_thread_id, parse_mode="HTML")
             return topic.message_thread_id
         except Exception as e:
-            logging.error(f"Ошибка создания топика: {e}")
+            logging.error(f"Error topic: {e}")
             return None
 
-    if not user:
-        topic_id = await create_topic()
-    else:
-        topic_id = user[1]
+    topic_id = user['topic_id'] if user and user['topic_id'] else await create_topic()
+    if not topic_id: return
 
-    if not topic_id:
-        return await message.answer("Ошибка связи с сервером поддержки.")
-
-    # Отправка в группу
     try:
         await message.copy_to(ADMIN_GROUP_ID, message_thread_id=topic_id)
-        # Подтверждение пользователю (исчезает через 5 сек)
         conf = await message.answer("✅ Отправлено")
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
         await conf.delete()
     except TelegramBadRequest:
-        # Если топик удален, создаем новый и пробуем снова
         new_tid = await create_topic()
-        if new_tid:
-            try:
-                await message.copy_to(ADMIN_GROUP_ID, message_thread_id=new_tid)
-            except: pass
-    except Exception:
-        pass
+        if new_tid: await message.copy_to(ADMIN_GROUP_ID, message_thread_id=new_tid)
 
-# --- ХЕНДЛЕРЫ АДМИНА (В ГРУППЕ) ---
+# --- КОМАНДЫ ВЛАДЕЛЬЦА (В ГРУППЕ) ---
 
-@dp.message(F.chat.id == ADMIN_GROUP_ID, F.message_thread_id)
-async def admin_reply(message: types.Message):
-    # Если это команда (начинается с /), не обрабатываем как ответ
-    if message.text and message.text.startswith("/"): return
-    
-    # Ищем пользователя по ID топика
-    topic_id = message.message_thread_id
-    user = await get_user_data(topic_id=topic_id)
-    
-    if not user:
-        return # Сообщение в топике, который не привязан к юзеру (или системный)
+@dp.message(Command("info"), F.chat.id == ADMIN_GROUP_ID)
+async def cmd_info(message: types.Message):
+    if message.from_user.id not in OWNER_IDS: return
+    user = await get_user_data(topic_id=message.message_thread_id)
+    if not user: return await message.reply("Юзер не найден.")
 
-    # Используем надежную отправку
-    await safe_reply_to_user(user[0], message)
-
-# --- КОМАНДЫ АДМИНА (BAN/WARN) ---
+    last_sanct = user['last_sanction_date'].strftime("%Y-%m-%d %H:%M") if user['last_sanction_date'] else "Нет"
+    text = (
+        f"👤 <b>Данные юзера:</b>\n"
+        f"ID: <code>{user['user_id']}</code>\n"
+        f"Ник: {user['full_name']}\n"
+        f"Юзернейм: @{user['username'] or 'нет'}\n"
+        f"Дата рег: {user['reg_date'].strftime('%Y-%m-%d')}\n"
+        f"Варны: {user['warns']}/3\n"
+        f"Бан: {'🔴 ДА' if user['is_banned'] else '🟢 НЕТ'}\n"
+        f"Посл. санкция: {last_sanct}"
+    )
+    await message.reply(text, parse_mode="HTML")
 
 @dp.message(Command("ban"), F.chat.id == ADMIN_GROUP_ID)
-async def ban_user(message: types.Message):
+async def cmd_ban(message: types.Message):
+    if message.from_user.id not in OWNER_IDS: return
     user = await get_user_data(topic_id=message.message_thread_id)
-    if not user: return await message.reply("Не найден пользователь для этого топика.")
-    
-    await update_ban(user[0], True)
-    await message.reply(f"🚫 Пользователь забанен.")
-    try: await bot.send_message(user[0], "🚫 Вы были заблокированы администрацией.")
-    except: pass
+    if user:
+        await update_sanction(user['user_id'], banned=True)
+        await message.reply("🚫 Пользователь забанен.")
+        try: await bot.send_message(user['user_id'], "🚫 Доступ заблокирован.")
+        except: pass
 
 @dp.message(Command("unban"), F.chat.id == ADMIN_GROUP_ID)
-async def unban_user(message: types.Message):
+async def cmd_unban(message: types.Message):
+    if message.from_user.id not in OWNER_IDS: return
     user = await get_user_data(topic_id=message.message_thread_id)
-    if not user: return
-    
-    await update_ban(user[0], False)
-    await update_warns(user[0], 0)
-    await message.reply(f"✅ Пользователь разбанен.")
-    try: await bot.send_message(user[0], "✅ Ваш доступ восстановлен.")
-    except: pass
+    if user:
+        await update_sanction(user['user_id'], banned=False, warns=0)
+        await message.reply("✅ Разбанен.")
 
 @dp.message(Command("warn"), F.chat.id == ADMIN_GROUP_ID)
-async def warn_user(message: types.Message):
+async def cmd_warn(message: types.Message):
+    if message.from_user.id not in OWNER_IDS: return
     user = await get_user_data(topic_id=message.message_thread_id)
-    if not user: return
-    
-    new_warns = user[3] + 1
-    if new_warns >= 3:
-        await update_ban(user[0], True)
-        await update_warns(user[0], new_warns)
-        await message.reply("⛔ 3/3 варна. Пользователь забанен.")
-        try: await bot.send_message(user[0], "⛔ Вы забанены за нарушения (3/3).")
-        except: pass
-    else:
-        await update_warns(user[0], new_warns)
-        await message.reply(f"⚠️ Варн выдан ({new_warns}/3).")
-        try: await bot.send_message(user[0], f"⚠️ Предупреждение ({new_warns}/3).")
-        except: pass
-
-@dp.message(Command("unwarn"), F.chat.id == ADMIN_GROUP_ID)
-async def unwarn_user(message: types.Message):
-    user = await get_user_data(topic_id=message.message_thread_id)
-    if not user: return
-    
-    new_warns = max(0, user[3] - 1)
-    await update_warns(user[0], new_warns)
-    await message.reply(f"✅ Варн снят. Теперь: {new_warns}/3")
-
-# --- УПРАВЛЕНИЕ АДМИНАМИ И СТАТИСТИКА (Только Владельцы) ---
-
-@dp.message(Command("add_admin"), F.chat.id == ADMIN_GROUP_ID)
-async def add_admin(message: types.Message, command: CommandObject):
-    if message.from_user.id not in OWNER_IDS: return await message.reply("❌ Нет прав.")
-    if not command.args: return await message.reply("Укажите ID.")
-    try:
-        uid = int(command.args)
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
-            await db.commit()
-        await message.reply(f"✅ Админ {uid} добавлен.")
-    except: await message.reply("Ошибка ID.")
+    if user:
+        new_w = user['warns'] + 1
+        await update_sanction(user['user_id'], warns=new_w, banned=(new_w >= 3))
+        await message.reply(f"⚠️ Варн {new_w}/3")
 
 @dp.message(Command("stats"), F.chat.id == ADMIN_GROUP_ID)
-async def stats(message: types.Message):
+async def cmd_stats(message: types.Message):
     if message.from_user.id not in OWNER_IDS: return
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT count(*) FROM users") as c: total = (await c.fetchone())[0]
-        async with db.execute("SELECT count(*) FROM users WHERE is_banned=1") as c: banned = (await c.fetchone())[0]
-    await message.reply(f"📊 <b>Статистика:</b>\nВсего: {total}\nВ бане: {banned}", parse_mode="HTML")
+    conn = await get_db_conn()
+    total = await conn.fetchval("SELECT count(*) FROM users")
+    banned = await conn.fetchval("SELECT count(*) FROM users WHERE is_banned = true")
+    await conn.close()
+    await message.reply(f"📊 Всего: {total}\n🚫 В бане: {banned}")
 
 @dp.message(Command("broadcast"), F.chat.id == ADMIN_GROUP_ID)
-async def broadcast(message: types.Message, state: FSMContext):
+async def cmd_broadcast(message: types.Message, state: FSMContext):
     if message.from_user.id not in OWNER_IDS: return
-    await message.reply("📢 Отправьте сообщение для рассылки.")
+    await message.reply("Введите сообщение для рассылки:")
     await state.set_state(BroadcastState.waiting_for_message)
 
 @dp.message(BroadcastState.waiting_for_message)
-async def do_broadcast(message: types.Message, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users WHERE is_banned=0") as c: users = await c.fetchall()
+async def process_broadcast(message: types.Message, state: FSMContext):
+    conn = await get_db_conn()
+    users = await conn.fetch("SELECT user_id FROM users WHERE is_banned = false")
+    await conn.close()
     
-    await message.reply(f"🚀 Рассылка на {len(users)} чел...")
+    await message.reply(f"Начинаю рассылку на {len(users)} чел.")
     count = 0
     for u in users:
         try:
-            await message.copy_to(u[0])
+            await message.copy_to(u['user_id'])
             count += 1
             await asyncio.sleep(0.05)
         except: pass
-    await message.reply(f"✅ Рассылка завершена. Дошло: {count}")
+    await message.reply(f"Завершено. Получили: {count}")
     await state.clear()
 
+# --- ОТВЕТ АДМИНА ---
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, F.message_thread_id)
+async def admin_reply_handler(message: types.Message):
+    if message.text and message.text.startswith("/"): return
+    user = await get_user_data(topic_id=message.message_thread_id)
+    if user:
+        await safe_reply_to_user(user['user_id'], message)
+
 async def main():
-    await init_db()
-    print("Бот запущен. Владельцы:", OWNER_IDS)
+    print("Бот запущен. База: Supabase. Владельцы:", OWNER_IDS)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
