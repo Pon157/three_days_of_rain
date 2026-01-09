@@ -5,29 +5,26 @@ import random
 import string
 import sys
 from datetime import datetime
-from typing import Union, List
+from typing import Union
 
-# Библиотеки для работы с API и Ботом
+# Убедимся, что все библиотеки доступны
 try:
     from supabase import create_client, Client
     from aiogram import Bot, Dispatcher, F, types
-    from aiogram.filters import Command, CommandStart, CommandObject
+    from aiogram.filters import Command, CommandStart
     from aiogram.fsm.context import FSMContext
     from aiogram.fsm.state import State, StatesGroup
     from aiogram.exceptions import (
         TelegramForbiddenError, 
         TelegramBadRequest, 
-        TelegramRetryAfter,
-        TelegramServerError
+        TelegramRetryAfter
     )
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
     from dotenv import load_dotenv
 except ImportError as e:
-    print(f"Критическая ошибка: Не установлена библиотека! {e}")
-    print("Выполните: pip install aiogram supabase python-dotenv")
+    print(f"Ошибка: Не установлены библиотеки! {e}")
     sys.exit(1)
 
-# --- ИНИЦИАЛИЗАЦИЯ КОНФИГУРАЦИИ ---
+# --- НАСТРОЙКИ ---
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -36,88 +33,72 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
-# Настройка логирования в консоль и файл
+# Логирование
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot_debug.log", encoding='utf-8')
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("AnonSupportBot")
+logger = logging.getLogger("AnonBot")
 
-# Проверка наличия всех переменных
-if not all([BOT_TOKEN, ADMIN_GROUP_ID, SUPABASE_URL, SUPABASE_KEY, OWNER_ID]):
-    logger.critical("Не все переменные окружения найдены в .env файле!")
-    sys.exit(1)
-
-# Инициализация объектов
+# Инициализация
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Состояния FSM
-class AdminStates(StatesGroup):
-    waiting_for_broadcast_msg = State()
+class BotStates(StatesGroup):
+    broadcast = State()
 
-# --- Вспомогательные функции БД ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
 
-def db_get_user(user_id: int = None, topic_id: int = None) -> Union[dict, None]:
-    """Универсальный поиск пользователя в Supabase"""
+def get_user(user_id: int = None, topic_id: int = None) -> Union[dict, None]:
     try:
-        query = supabase.table("users").select("*")
+        table = supabase.table("users")
         if user_id:
-            res = query.eq("user_id", user_id).execute()
+            res = table.select("*").eq("user_id", user_id).execute()
         elif topic_id:
-            res = query.eq("topic_id", topic_id).execute()
+            res = table.select("*").eq("topic_id", topic_id).execute()
         else:
             return None
         return res.data[0] if res.data else None
     except Exception as e:
-        logger.error(f"Ошибка чтения БД: {e}")
+        logger.error(f"Ошибка БД (get): {e}")
         return None
 
-def db_sync_user(user: types.User, topic_id: int = None, topic_name: str = None):
-    """Синхронизация данных пользователя (Upsert)"""
-    payload = {
+def sync_user_data(user: types.User, topic_id: int = None, topic_name: str = None):
+    data = {
         "user_id": user.id,
         "username": user.username,
         "full_name": user.full_name,
         "last_seen": datetime.now().isoformat()
     }
     if topic_id:
-        payload.update({"topic_id": topic_id, "topic_name": topic_name})
-    
+        data.update({"topic_id": topic_id, "topic_name": topic_name})
     try:
-        supabase.table("users").upsert(payload).execute()
-        logger.info(f"Синхронизация юзера {user.id} прошла успешно.")
+        supabase.table("users").upsert(data).execute()
     except Exception as e:
-        logger.error(f"Ошибка синхронизации БД: {e}")
+        logger.error(f"Ошибка БД (sync): {e}")
 
-def db_update_status(user_id: int, **kwargs):
-    """Обновление полей (ban, warns и т.д.)"""
+def update_user_sanctions(user_id: int, **kwargs):
     try:
         kwargs["last_sanction_date"] = datetime.now().isoformat()
         supabase.table("users").update(kwargs).eq("user_id", user_id).execute()
     except Exception as e:
-        logger.error(f"Ошибка обновления статуса юзера {user_id}: {e}")
+        logger.error(f"Ошибка БД (update): {e}")
 
-# --- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЯ ---
+# --- ОБРАБОТКА ПОЛЬЗОВАТЕЛЕЙ ---
 
 @dp.message(F.chat.type == "private", CommandStart())
-async def handle_start(message: types.Message):
-    """Команда /start с твоим оригинальным текстом"""
-    user_id = message.from_user.id
-    db_user = db_get_user(user_id=user_id)
-    
-    if db_user and db_user.get('is_banned'):
-        return logger.info(f"Забаненный юзер {user_id} пытался нажать старт.")
+async def start_handler(message: types.Message):
+    """Стартовое сообщение с твоим текстом"""
+    db_user = get_user(user_id=message.from_user.id)
+    if db_user and db_user.get("is_banned"):
+        return
 
-    db_sync_user(message.from_user)
+    sync_user_data(message.from_user)
 
-    photo_url = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
-    welcome_text = (
+    photo = "https://i.postimg.cc/RFrwrtY8/photo-2026-01-07-11-42-49.jpg"
+    text = (
         "👋 <b>Привет, путник мира!</b>\n\n"
         "Знакомо чувство, когда после эпичной битвы хочется отдохнуть и поболтать с кем-то по душам? "
         "Или когда уже не хочется жить из-за тимейтов, которые идут на слив и пикают кого попало?\n\n"
@@ -127,194 +108,168 @@ async def handle_start(message: types.Message):
     )
 
     try:
-        sent_msg = await message.answer_photo(
-            photo=photo_url, 
-            caption=welcome_text, 
-            parse_mode="HTML"
-        )
-        await bot.pin_chat_message(message.chat.id, sent_msg.message_id)
-    except Exception as e:
-        logger.warning(f"Не удалось закрепить или отправить фото: {e}")
-        await message.answer(welcome_text, parse_mode="HTML", disable_web_page_preview=False)
+        m = await message.answer_photo(photo, caption=text, parse_mode="HTML")
+        await bot.pin_chat_message(message.chat.id, m.message_id)
+    except:
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=False)
 
 @dp.message(F.chat.type == "private")
-async def handle_user_message(message: types.Message):
-    """Пересылка сообщения админам в Forum Topic"""
-    if message.from_user.id == bot.id:
+async def forward_to_admin(message: types.Message):
+    """Пересылка сообщений от пользователя к админам"""
+    # Игнорируем самого бота и сервисные сообщения
+    if message.from_user.id == bot.id or message.type in [types.ContentType.NEW_CHAT_MEMBERS, types.ContentType.LEFT_CHAT_MEMBER]:
         return
 
-    db_user = db_get_user(user_id=message.from_user.id)
-    
-    if db_user and db_user.get('is_banned'):
+    db_user = get_user(user_id=message.from_user.id)
+    if db_user and db_user.get("is_banned"):
         return
 
-    # Проверка или создание топика
-    topic_id = db_user.get('topic_id') if db_user else None
-    
+    # Проверяем наличие топика
+    topic_id = db_user.get("topic_id") if db_user else None
+
     if not topic_id:
         try:
-            rnd_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
-            topic_name = f"User #{rnd_id}"
-            new_topic = await bot.create_forum_topic(ADMIN_GROUP_ID, topic_name)
+            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+            t_name = f"Anon {code}"
+            new_topic = await bot.create_forum_topic(ADMIN_GROUP_ID, t_name)
             topic_id = new_topic.message_thread_id
-            db_sync_user(message.from_user, topic_id, topic_name)
+            sync_user_data(message.from_user, topic_id, t_name)
             
             await bot.send_message(
                 ADMIN_GROUP_ID, 
-                f"🆕 <b>Новый чат открыт!</b>\nЮзер: {message.from_user.full_name}",
+                f"🆕 <b>Новый пользователь:</b> {message.from_user.full_name}",
                 message_thread_id=topic_id,
                 parse_mode="HTML"
             )
         except Exception as e:
-            logger.error(f"Критическая ошибка создания топика: {e}")
-            return await message.answer("⚠️ Ошибка на стороне сервера. Попробуйте позже.")
+            logger.error(f"Ошибка создания топика: {e}")
+            return await message.answer("Ошибка связи. Попробуйте позже.")
 
+    # Пытаемся скопировать сообщение
     try:
         await message.copy_to(ADMIN_GROUP_ID, message_thread_id=topic_id)
-        # Временное уведомление
-        status_msg = await message.answer("✅ Доставлено")
+        # Подтверждение (удаляется через 2 сек)
+        confirm = await message.answer("✅ Отправлено")
         await asyncio.sleep(2)
-        await status_msg.delete()
+        await confirm.delete()
     except TelegramBadRequest:
-        logger.warning("Сообщение защищено от копирования, отправляем текст.")
-        await bot.send_message(ADMIN_GROUP_ID, f"📎 <i>(Медиа или текст нельзя скопировать напрямую)</i>\n\n{message.text or 'Вложение'}", message_thread_id=topic_id)
-    except Exception as e:
-        logger.error(f"Ошибка пересылки: {e}")
+        # Если копия невозможна (защищенный контент), шлем текстом
+        await bot.send_message(
+            ADMIN_GROUP_ID, 
+            f"⚠️ (Защищено) Сообщение:\n{message.text or '[Медиа без текста]'}", 
+            message_thread_id=topic_id
+        )
 
-# --- АДМИН-КОМАНДЫ (В ГРУППЕ) ---
+# --- АДМИН КОМАНДЫ ---
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("info"))
-async def admin_info(message: types.Message):
+async def info_cmd(message: types.Message):
     if message.from_user.id != OWNER_ID: return
-    
-    target_user = db_get_user(topic_id=message.message_thread_id)
-    if not target_user:
-        return await message.reply("❌ Пользователь не найден в базе данных.")
+    user = get_user(topic_id=message.message_thread_id)
+    if not user: return await message.reply("Пользователь не найден.")
 
-    info_card = (
-        "👤 <b>Профиль пользователя</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"<b>TG-ID:</b> <code>{target_user['user_id']}</code>\n"
-        f"<b>Имя:</b> {target_user['full_name']}\n"
-        f"<b>Username:</b> @{target_user['username'] or '—'}\n"
-        f"<b>Варны:</b> {target_user['warns']}/3\n"
-        f"<b>Статус:</b> {'🚫 ЗАБАНЕН' if target_user['is_banned'] else '✅ АКТИВЕН'}\n"
-        f"<b>Последняя санкция:</b> {target_user.get('last_sanction_date', 'Нет')}\n"
-        "━━━━━━━━━━━━━━━━━━"
+    await message.reply(
+        f"👤 <b>Инфо:</b>\nID: <code>{user['user_id']}</code>\n"
+        f"Имя: {user['full_name']}\n"
+        f"Варны: {user['warns']}/3\n"
+        f"Бан: {'Да' if user['is_banned'] else 'Нет'}",
+        parse_mode="HTML"
     )
-    await message.reply(info_card, parse_mode="HTML")
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("ban"))
-async def admin_ban(message: types.Message):
+async def ban_cmd(message: types.Message):
     if message.from_user.id != OWNER_ID: return
-    user = db_get_user(topic_id=message.message_thread_id)
+    user = get_user(topic_id=message.message_thread_id)
     if user:
-        db_update_status(user['user_id'], is_banned=True)
-        await message.reply("🚫 Пользователь заблокирован.")
-        try: await bot.send_message(user['user_id'], "🚫 Вы были заблокированы администрацией.")
+        update_user_sanctions(user['user_id'], is_banned=True)
+        await message.reply("🚫 Забанен.")
+        try: await bot.send_message(user['user_id'], "🚫 Доступ ограничен.")
         except: pass
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("unban"))
-async def admin_unban(message: types.Message):
+async def unban_cmd(message: types.Message):
     if message.from_user.id != OWNER_ID: return
-    user = db_get_user(topic_id=message.message_thread_id)
+    user = get_user(topic_id=message.message_thread_id)
     if user:
-        db_update_status(user['user_id'], is_banned=False, warns=0)
-        await message.reply("✅ Пользователь разблокирован, варны обнулены.")
-        try: await bot.send_message(user['user_id'], "✅ Ваш доступ к поддержке восстановлен.")
-        except: pass
+        update_user_sanctions(user['user_id'], is_banned=False, warns=0)
+        await message.reply("✅ Разбанен.")
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("warn"))
-async def admin_warn(message: types.Message):
+async def warn_cmd(message: types.Message):
     if message.from_user.id != OWNER_ID: return
-    user = db_get_user(topic_id=message.message_thread_id)
+    user = get_user(topic_id=message.message_thread_id)
     if user:
-        current_warns = (user.get('warns') or 0) + 1
-        ban_now = current_warns >= 3
-        db_update_status(user['user_id'], warns=current_warns, is_banned=ban_now)
-        
-        msg = f"⚠️ Выдан варн {current_warns}/3."
-        if ban_now: msg += "\n🛑 Лимит достигнут, бан выдан автоматически."
-        await message.reply(msg)
-        try: await bot.send_message(user['user_id'], f"⚠️ Вам выдано предупреждение ({current_warns}/3).")
+        new_w = (user['warns'] or 0) + 1
+        ban_it = new_w >= 3
+        update_user_sanctions(user['user_id'], warns=new_w, is_banned=ban_it)
+        await message.reply(f"⚠️ Варн {new_w}/3. {'(Авто-бан)' if ban_it else ''}")
+        try: await bot.send_message(user['user_id'], f"⚠️ Предупреждение {new_w}/3")
         except: pass
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("stats"))
-async def admin_stats(message: types.Message):
+async def stats_cmd(message: types.Message):
     if message.from_user.id != OWNER_ID: return
-    try:
-        total = supabase.table("users").select("user_id", count="exact").execute().count
-        banned = supabase.table("users").select("user_id", count="exact").eq("is_banned", True).execute().count
-        await message.reply(f"📊 <b>Статистика бота:</b>\n\nВсего юзеров в базе: {total}\nВ бане: {banned}", parse_mode="HTML")
-    except Exception as e:
-        await message.reply(f"Ошибка получения статистики: {e}")
+    all_users = supabase.table("users").select("user_id", count="exact").execute()
+    banned = supabase.table("users").select("user_id", count="exact").eq("is_banned", True).execute()
+    await message.reply(f"📊 Всего: {all_users.count}\n🚫 В бане: {banned.count}")
 
-# --- ГЛОБАЛЬНАЯ РАССЫЛКА ---
+# --- РАССЫЛКА ---
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, Command("broadcast"))
-async def broadcast_start(message: types.Message, state: FSMContext):
+async def start_bc(message: types.Message, state: FSMContext):
     if message.from_user.id != OWNER_ID: return
-    await message.reply("📢 Отправьте сообщение для рассылки всем пользователям (можно с фото/видео).")
-    await state.set_state(AdminStates.waiting_for_broadcast_msg)
+    await message.reply("Пришлите сообщение для рассылки:")
+    await state.set_state(BotStates.broadcast)
 
-@dp.message(AdminStates.waiting_for_broadcast_msg)
-async def broadcast_process(message: types.Message, state: FSMContext):
+@dp.message(BotStates.broadcast)
+async def do_bc(message: types.Message, state: FSMContext):
     await state.clear()
     users = supabase.table("users").select("user_id").execute().data
     
-    confirm = await message.reply(f"🚀 Начинаю рассылку на {len(users)} чел...")
-    success, failed = 0, 0
-    
+    await message.reply(f"📢 Начинаю рассылку на {len(users)} чел.")
+    ok, err = 0, 0
     for u in users:
         try:
             await message.copy_to(u['user_id'])
-            success += 1
-            await asyncio.sleep(0.05) # Плавная рассылка
+            ok += 1
+            await asyncio.sleep(0.05)
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
             await message.copy_to(u['user_id'])
-            success += 1
-        except Exception:
-            failed += 1
-            
-    await confirm.edit_text(f"🏁 <b>Рассылка завершена!</b>\n✅ Успешно: {success}\n❌ Не удалось: {failed}", parse_mode="HTML")
+            ok += 1
+        except:
+            err += 1
+    await message.reply(f"🏁 Готово! ✅ {ok} | ❌ {err}")
 
-# --- ОТВЕТ АДМИНА ПОЛЬЗОВАТЕЛЮ ---
+# --- ОТВЕТ АДМИНА ---
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, F.is_topic_message)
-async def handle_admin_reply(message: types.Message):
-    """Отправка ответа из топика обратно юзеру"""
+async def admin_to_user(message: types.Message):
+    # Строжайшая проверка, чтобы не копировать лишнее
     if message.from_user.id == bot.id or (message.text and message.text.startswith("/")):
         return
 
-    user_data = db_get_user(topic_id=message.message_thread_id)
-    if user_data:
+    # Проверяем, что это не сервисное уведомление Telegram
+    if not message.from_user or message.is_automatic_forward:
+        return
+
+    user = get_user(topic_id=message.message_thread_id)
+    if user:
         try:
-            await message.copy_to(user_data['user_id'])
-        except TelegramForbiddenError:
-            await message.reply("❌ Бот заблокирован пользователем.")
+            await message.copy_to(user['user_id'])
         except Exception as e:
-            logger.error(f"Ошибка при ответе админа: {e}")
-            await message.reply(f"❌ Ошибка отправки: {e}")
+            logger.error(f"Ошибка доставки ответа: {e}")
+            await message.reply("Не удалось отправить. Возможно, бот заблокирован.")
 
-# --- ТОЧКА ВХОДА ---
+# --- ЗАПУСК ---
 
-async def on_startup():
-    logger.info("Проверка соединения с Supabase...")
-    try:
-        supabase.table("users").select("user_id").limit(1).execute()
-        logger.info("Соединение с БД успешно!")
-    except Exception as e:
-        logger.error(f"Ошибка БД при запуске: {e}")
-
-async def run_bot():
-    await on_startup()
+async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info(f"Бот онлайн! Владелец ID: {OWNER_ID}")
+    logger.info("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        logger.info("Бот выключен пользователем.")
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот выключен.")
