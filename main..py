@@ -17,7 +17,8 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
-DATABASE_URL = os.getenv("DATABASE_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Парсим владельцев
 raw_owners = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID") or ""
