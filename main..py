@@ -498,7 +498,8 @@ async def send_message_to_admin(bot: Bot, user_id: int, message: Message, topic_
         # Форматируем сообщение в зависимости от типа контента
         if message.text:
             # Текстовое сообщение
-            formatted_text = f"👤 <b>{user['anon_id']}</b>\n━━━━━━━━━━━━━━\n{message.text}"
+            text_content = message.html_text if hasattr(message, 'html_text') else message.text
+            formatted_text = f"👤 <b>{user['anon_id']}</b>\n━━━━━━━━━━━━━━\n{text_content}"
             sent_msg = await bot.send_message(
                 chat_id=ADMIN_GROUP_ID,
                 text=formatted_text,
@@ -509,16 +510,18 @@ async def send_message_to_admin(bot: Bot, user_id: int, message: Message, topic_
             
         elif message.photo:
             # Фото с подписью
-            caption = f"👤 <b>{user['anon_id']}</b>\n━━━━━━━━━━━━━━\n{message.caption or ''}"
+            caption_content = message.html_text if hasattr(message, 'html_text') and message.caption else message.caption
+            caption = f"👤 <b>{user['anon_id']}</b>\n━━━━━━━━━━━━━━\n{caption_content or ''}"
             sent_msg = await bot.send_photo(
                 chat_id=ADMIN_GROUP_ID,
                 photo=message.photo[-1].file_id,
                 caption=caption,
-                parse_mode="HTML",
+                parse_mode="HTML" if caption_content else None,
                 message_thread_id=topic_id
             )
             return sent_msg
             
+
         elif message.video:
             # Видео
             caption = f"👤 <b>{user['anon_id']}</b>\n━━━━━━━━━━━━━━\n{message.caption or ''}"
