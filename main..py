@@ -1685,8 +1685,9 @@ async def gateway_u2a(message: Message, state: FSMContext):
             except:
                 pass  # Если реакции не поддерживаются
             
-            # Ставим реакцию админу в группе
-            await safe_set_reaction(bot, ADMIN_GROUP_ID, sent_message.message_id, "👍")
+            # Ждем немного и ставим реакцию админу в группе
+            await asyncio.sleep(0.5)
+            await safe_set_reaction(bot, ADMIN_GROUP_ID, sent_message.message_id, "👤")
         else:
             logger.error(f"Failed to send message from user {message.from_user.id} to admin")
             try:
@@ -1724,10 +1725,11 @@ async def gateway_a2u(message: Message):
             # Отправляем сообщение пользователю
             sent_message = await send_message_to_user(bot, u['user_id'], message)
             
-            # Ставим реакцию админу в группе
+            # Ставим реакцию админу в группе (лайк)
             await safe_set_reaction(bot, ADMIN_GROUP_ID, message.message_id, "👍")
             
-            # Ставим реакцию пользователю
+            # Ждем немного и ставим реакцию пользователю
+            await asyncio.sleep(0.5)
             await safe_set_reaction(bot, u['user_id'], sent_message.message_id, "👍")
                 
         except TelegramForbiddenError:
@@ -1744,7 +1746,7 @@ async def gateway_a2u(message: Message):
             logger.error(f"A2U gateway error: {e}")
             # Пробуем поставить реакцию об ошибке
             await safe_set_reaction(bot, ADMIN_GROUP_ID, message.message_id, "❌")
-
+            
 # --- ОЧИСТКА КЭША ---
 @dp.callback_query(F.data == "admin_clear_cache")
 async def clear_cache(call: CallbackQuery):
