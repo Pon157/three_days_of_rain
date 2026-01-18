@@ -165,7 +165,7 @@ def get_main_kb():
 
 def get_categories_kb():
     b = InlineKeyboardBuilder()
-    categories = ["🛠 Тех. вопрос", "🎨 Поддержка", "🎉 Общение]
+    categories = ["🛠 Тех. вопрос", "🎨 Поддержка", "🎉 Общение"]
     for cat in categories:
         b.button(text=cat, callback_data=f"cat_{cat}")
     b.adjust(2)
