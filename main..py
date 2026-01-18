@@ -450,6 +450,8 @@ async def init_ticket(uid: int, bot: Bot, category: str):
         logger.error(f"Ticket Init Error: {e}")
         return None
 
+# Заменяем функции send_message_to_admin и send_message_to_user, а также обработчики gateway
+
 # --- 7. УЛУЧШЕННЫЙ GATEWAY С РЕАКЦИЯМИ ---
 async def safe_set_reaction(bot: Bot, chat_id: int, message_id: int, emoji: str):
     """Безопасная установка реакции с обработкой ошибок"""
@@ -521,7 +523,6 @@ async def send_message_to_admin(bot: Bot, user_id: int, message: Message, topic_
             )
             return sent_msg
             
-
         elif message.video:
             # Видео
             caption = f"👤 <b>{user['anon_id']}</b>\n━━━━━━━━━━━━━━\n{message.caption or ''}"
@@ -692,7 +693,109 @@ async def send_message_to_user(bot: Bot, user_id: int, message: Message):
     except Exception as e:
         logger.error(f"Error sending message to user: {e}")
         raise
+
+# --- GATEWAY ПЕРЕПИСКИ С РЕАКЦИЯМИ (ИСПРАВЛЕННЫЙ) ---
+@dp.message(F.chat.type == "private")
+async def gateway_u2a(message: Message, state: FSMContext):
+    # Игнорируем служебные сообщения и кнопки
+    if message.content_type in [
+        ContentType.FORUM_TOPIC_CREATED,
+        ContentType.FORUM_TOPIC_EDITED,
+        ContentType.FORUM_TOPIC_CLOSED,
+        ContentType.FORUM_TOPIC_REOPENED,
+        ContentType.GENERAL_FORUM_TOPIC_HIDDEN,
+        ContentType.GENERAL_FORUM_TOPIC_UNHIDDEN
+    ]:
+        return
+    
+    protected_buttons = ["🆘 Создать обращение", "⭐️ Оставить отзыв", "📊 Стена отзывов", "👤 Мой профиль", "❌ Отмена"]
+    
+    if await state.get_state() or (message.text and (message.text.startswith("/") or message.text in protected_buttons)):
+        return
+
+    u = await db_engine.get_user(uid=message.from_user.id)
+    if not u or not u['topic_id']:
+        return await message.answer(
+            "⚠️ <b>Сначала создайте обращение!</b>\n\n"
+            "1. Нажмите кнопку <b>'🆘 Создать обращение'</b>\n"
+            "2. Выберите категорию вопроса\n"
+            "3. Напишите ваш вопрос в чат\n\n"
+            "<i>После этого администраторы смогут вам ответить.</i>",
+            parse_mode="HTML"
+        )
+
+    try:
+        # Отправляем сообщение админу
+        sent_message = await send_message_to_admin(bot, message.from_user.id, message, u['topic_id'])
+        
+        if sent_message:
+            # Обновляем статистику
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("UPDATE users SET msg_count = msg_count + 1, last_seen = ? WHERE user_id = ?", 
+                               (datetime.now(), message.from_user.id))
+                await db.commit()
             
+            # Ставим реакцию только пользователю (подтверждение отправки)
+            try:
+                await message.react([ReactionTypeEmoji(emoji="✅")])
+            except:
+                logger.warning(f"Cannot react to user message {message.message_id}")
+        else:
+            logger.error(f"Failed to send message from user {message.from_user.id} to admin")
+            try:
+                await message.react([ReactionTypeEmoji(emoji="❌")])
+            except:
+                pass
+            
+    except Exception as e:
+        logger.error(f"U2A gateway error: {e}")
+        # Показываем пользователю, что произошла ошибка
+        try:
+            await message.react([ReactionTypeEmoji(emoji="❌")])
+        except:
+            pass
+
+@dp.message(F.chat.id == ADMIN_GROUP_ID, F.is_topic_message)
+async def gateway_a2u(message: Message):
+    # Игнорируем команды и служебные сообщения
+    if message.text and message.text.startswith("/"):
+        return
+    
+    if message.content_type in [
+        ContentType.FORUM_TOPIC_CREATED,
+        ContentType.FORUM_TOPIC_EDITED,
+        ContentType.FORUM_TOPIC_CLOSED,
+        ContentType.FORUM_TOPIC_REOPENED,
+        ContentType.GENERAL_FORUM_TOPIC_HIDDEN,
+        ContentType.GENERAL_FORUM_TOPIC_UNHIDDEN
+    ]:
+        return
+    
+    u = await db_engine.get_user(tid=message.message_thread_id)
+    if u:
+        try:
+            # Отправляем сообщение пользователю
+            sent_message = await send_message_to_user(bot, u['user_id'], message)
+            
+            # Ставим реакцию только админу в группе (подтверждение доставки)
+            await safe_set_reaction(bot, ADMIN_GROUP_ID, message.message_id, "✅")
+            
+            # НЕ ставим реакцию пользователю - это избыточно
+                
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота
+            logger.warning(f"User {u['user_id']} blocked the bot")
+            await safe_set_reaction(bot, ADMIN_GROUP_ID, message.message_id, "❌")
+            
+            # Деактивируем пользователя в БД
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (u['user_id'],))
+                await db.commit()
+            
+        except Exception as e:
+            logger.error(f"A2U gateway error: {e}")
+            # Пробуем поставить реакцию об ошибке
+            await safe_set_reaction(bot, ADMIN_GROUP_ID, message.message_id, "❌")
 
 # --- 8. ХЕНДЛЕРЫ ---
 bot = Bot(token=BOT_TOKEN)
