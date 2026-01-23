@@ -362,6 +362,7 @@ async def do_bc(message: types.Message, state: FSMContext):
     await state.clear()
     
     try:
+        # Получаем всех, кто не забанен (или всех вообще, как у вас сейчас)
         users_res = supabase.table("users").select("user_id").execute()
         users = users_res.data if hasattr(users_res, 'data') else []
         
@@ -370,35 +371,64 @@ async def do_bc(message: types.Message, state: FSMContext):
         
         await message.reply(f"📢 Начинаю рассылку на {len(users)} пользователей...")
         
-        ok, err = 0, 0
+        ok, err, blocked = 0, 0, 0
+        
         for idx, u in enumerate(users, 1):
+            user_id = u['user_id']
             try:
-                await message.copy_to(u['user_id'])
+                await message.copy_to(user_id)
                 ok += 1
                 
-                # Делаем небольшую задержку каждые 10 сообщений
+                # Задержки для безопасности
                 if idx % 10 == 0:
                     await asyncio.sleep(0.5)
                 else:
                     await asyncio.sleep(0.05)
-                    
+            
+            # --- ВАЖНОЕ ИЗМЕНЕНИЕ ЗДЕСЬ ---
+            except TelegramForbiddenError:
+                # Пользователь заблокировал бота
+                blocked += 1
+                err += 1
+                try:
+                    # Помечаем пользователя в базе как забаненного (мертвого), 
+                    # чтобы он перестал считаться активным в статистике.
+                    # Либо можно использовать .delete(), если хотите удалять насовсем.
+                    supabase.table("users").update({"is_banned": True}).eq("user_id", user_id).execute()
+                    logger.info(f"Пользователь {user_id} пометил бота как спам/заблокировал. Обновлен статус.")
+                except Exception as db_e:
+                    logger.error(f"Ошибка обновления статуса блокировки для {user_id}: {db_e}")
+
             except TelegramRetryAfter as e:
+                # Лимит запросов, ждем и пробуем снова
                 await asyncio.sleep(e.retry_after)
                 try:
-                    await message.copy_to(u['user_id'])
+                    await message.copy_to(user_id)
                     ok += 1
-                except:
+                except TelegramForbiddenError:
+                     # Если даже после паузы выяснилось, что блок
+                    blocked += 1
                     err += 1
+                    supabase.table("users").update({"is_banned": True}).eq("user_id", user_id).execute()
+                except Exception:
+                    err += 1
+
             except Exception as e:
-                logger.error(f"Ошибка отправки пользователю {u['user_id']}: {e}")
+                # Другие ошибки (например, удаленный аккаунт или чат не найден)
+                logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
                 err += 1
         
-        await message.reply(f"🏁 Рассылка завершена!\n✅ Успешно: {ok}\n❌ Ошибок: {err}")
+        await message.reply(
+            f"🏁 Рассылка завершена!\n"
+            f"✅ Успешно: {ok}\n"
+            f"❌ Ошибок: {err}\n"
+            f"💀 Бот заблокирован у: {blocked} (база обновлена)"
+        )
         
     except Exception as e:
         logger.error(f"Ошибка в рассылке: {e}")
         await message.reply(f"❌ Ошибка рассылки: {e}")
-
+        
 # --- ОТВЕТ АДМИНА ---
 
 @dp.message(F.chat.id == ADMIN_GROUP_ID, F.is_topic_message)
