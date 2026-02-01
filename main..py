@@ -201,7 +201,7 @@ async def forward_to_admin(message: types.Message):
                 
                 await bot.send_message(
                     ADMIN_GROUP_ID, 
-                    f"🆕 <b>Новый диалог</b>\n👤: {message.from_user.full_name}\n🆔: <code>{message.from_user.id}</code>",
+                    f"🆕 <b>Новый диалог</b>",
                     message_thread_id=topic_id,
                     parse_mode="HTML"
                 )
